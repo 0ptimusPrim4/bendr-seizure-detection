@@ -1,0 +1,184 @@
+# Конфигурация системы детекции эпилептических приступов на основе BENDR.
+# Числа ниже взяты из постановки задачи. Поля со значением null в задании
+# не определены и сознательно не заполнены.
+# Масштаб модели задаётся ключом model.scale, а не хардкодом в исходниках.
+
+seed: 42
+
+paths:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  annotations_dir: data/annotations
+  weights_dir: weights
+  checkpoints_dir: checkpoints
+  logs_dir: logs
+  results_dir: results
+
+data:
+  dataset: chb-mit
+  source_url: https://physionet.org/content/chbmit/1.0.0/
+  sampling_rate_hz: 256
+  window_sec: 4
+  n_channels_in: 23
+  n_channels_out: 20
+  postictal_exclusion_min: 15
+  patients:
+    - chb01
+    - chb02
+    - chb03
+    - chb04
+    - chb05
+    - chb06
+    - chb07
+    - chb08
+    - chb09
+    - chb10
+    - chb11
+    - chb12
+    - chb13
+    - chb14
+    - chb15
+    - chb16
+    - chb17
+    - chb18
+    - chb19
+    - chb20
+    - chb21
+    - chb22
+    - chb23
+  critical_patients:
+    - chb04
+    - chb12
+    - chb15
+  filter:
+    type: butterworth
+    order: 5
+    low_hz: 0.5
+    high_hz: 50.0
+  normalization:
+    # Допустимые значения: z-score, min-max.
+    # Статистики считаются только по обучающей выборке.
+    method: z-score
+    fit_on: train
+  balancing:
+    # Допустимые значения: weighted_random_sampling, smote.
+    method: weighted_random_sampling
+  channels:
+    # Эталонный биполярный монтаж chb01 по официальной сводке PhysioNet.
+    # У других пациентов список берётся из их summary: он бывает длиннее 23
+    # и может содержать «-» и канал ECG.
+    chb01_reference:
+      - FP1-F7
+      - F7-T7
+      - T7-P7
+      - P7-O1
+      - FP1-F3
+      - F3-C3
+      - C3-P3
+      - P3-O1
+      - FP2-F4
+      - F4-C4
+      - C4-P4
+      - P4-O2
+      - FP2-F8
+      - F8-T8
+      - T8-P8
+      - P8-O2
+      - FZ-CZ
+      - CZ-PZ
+      - P7-T7
+      - T7-FT9
+      - FT9-FT10
+      - FT10-T8
+      - T8-P8
+    # Какие именно 20 каналов оставить под предобучение на TUEG, в задании не названы.
+    tueg_keep: null
+
+model:
+  scale: "55%"
+  conv_filters: 512
+  conv_kernels: [3, 2, 2, 2, 2, 2]
+  downsample_factor: 96
+  channel_dropout_p: 0.5
+  activation: gelu
+  d_model: 1536
+  ff_dim: 3076
+  relative_pos_kernel: 25
+  relative_pos_groups: 16
+  masking: false
+  n_classes: 2
+  class_names:
+    - фон
+    - приступ
+  use_first_token: true
+  scales:
+    "100%":
+      conv_blocks: 6
+      transformer_layers: 8
+      transformer_heads: 8
+    "55%":
+      conv_blocks: 6
+      transformer_layers: 4
+      transformer_heads: 4
+    "25%":
+      conv_blocks: null
+      transformer_layers: null
+      transformer_heads: null
+
+loss:
+  name: sensitivity_specificity_weighted_cross_entropy
+  alpha: 0.3
+  beta: 0.5
+
+training:
+  optimizer: adam
+  lr: 0.0001
+  weight_decay: 0.01
+  scheduler: reduce_on_plateau
+  scheduler_mode: min
+  scheduler_factor: 0.1
+  scheduler_patience: 5
+  early_stopping_monitor: val_loss
+  early_stopping_patience: 15
+  early_stopping_min_delta: 0.0001
+  batch_size: 256
+  # Уменьшенный размер батча для отладки на CPU в задании числом не задан.
+  batch_size_cpu: null
+  max_epochs: 120
+  freeze_encoder: false
+  lopo:
+    # Доля валидации внутри 22 пациентов в задании не задана.
+    val_fraction: null
+  logging:
+    tensorboard: true
+    wandb: false
+    wandb_project: bendr-seizure-detection
+
+postprocessing:
+  smoothing:
+    enabled: true
+    method: majority_voting
+    window: 3
+  fp_grouping:
+    enabled: true
+  event_based_sensitivity:
+    enabled: true
+
+metrics:
+  # FP/h = (1 - specificity) * 3600 / window_sec.
+  # Для окна 4 с множитель равен 900.
+  fp_per_hour: "(1 - specificity) * 3600 / window_sec"
+  targets:
+    sensitivity_min: 0.65
+    specificity_min: 0.99
+    fp_per_hour_max: 1.0
+    event_sensitivity_min: 0.70
+
+weights:
+  encoder_filename: encoder.pt
+  contextualizer_filename: contextualizer.pt
+  source_url: https://github.com/SPOClab-ca/BENDR/releases/tag/v0.1-alpha
+  paper_doi: 10.3389/fnhum.2021.653659
+
+device:
+  prefer_cuda: true
