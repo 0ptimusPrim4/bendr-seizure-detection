@@ -1,96 +1,60 @@
-"""Классификатор приступа на энкодере BENDR.
+"""BENDR: свёртки, трансформер и голова на два класса.
 
-``BENDREncoder`` — свёрточный фронт-энд и трансформер. ``ClassificationHead`` —
-линейный слой и Softmax по двум классам. Решение снимается с первого токена.
-``BENDRClassifier.load_pretrained`` подставляет веса только в энкодер:
-голова остаётся случайной.
-
-Относительное позиционное кодирование и инициализация T-fixup описаны
-в ``src/models/layers.py`` и подключаются вместе с разбором релизных весов.
-Маскирование на тонкой настройке выключено (``model.masking: false``).
+load_pretrained подставляет только энкодер. Голова остаётся случайной.
+Маскирование на тонкой настройке выключено.
 """
-
-from __future__ import annotations
 
 from pathlib import Path
 
 import torch
 from torch import nn
 
+from src.models.layers import ChannelDropout, RelativePosition
+
+
 class ModelConfigError(ValueError):
-    """Конфиг модели не задаёт рабочую архитектуру BENDR."""
+    """Конфиг модели кривой."""
 
 
 class PretrainedLoadError(RuntimeError):
-    """Файл весов нельзя подставить в энкодер."""
-
-
-class ChannelDropout(nn.Module):
-    """Обнуляет целые каналы ЭЭГ, а не отдельные отсчёты.
-
-    В режиме оценки ничего не меняет. Вероятность берётся из
-    ``model.channel_dropout_p``.
-    """
-
-    def __init__(self, probability: float) -> None:
-        super().__init__()
-        if not 0.0 <= probability < 1.0:
-            raise ModelConfigError(
-                f"channel_dropout_p должен быть в полуинтервале [0, 1), получено: {probability}."
-            )
-        self.probability = float(probability)
-
-    def forward(self, signal: torch.Tensor) -> torch.Tensor:
-        """Обнулить каналы входа ``[B, C, T]`` во время обучения."""
-        if not self.training or self.probability == 0.0:
-            return signal
-        keep = 1.0 - self.probability
-        mask = torch.bernoulli(signal.new_full((signal.shape[0], signal.shape[1], 1), keep))
-        return signal * mask
+    """Файл весов не подставился в энкодер."""
 
 
 class ClassificationHead(nn.Module):
-    """Линейный слой и Softmax: фон и приступ."""
+    """Linear и Softmax: фон и приступ."""
 
-    def __init__(self, d_model: int, n_classes: int) -> None:
+    def __init__(self, d_model, n_classes):
         super().__init__()
         if d_model < 1 or n_classes < 2:
-            raise ModelConfigError(
-                f"Голове нужны d_model ≥ 1 и хотя бы 2 класса, получено {d_model} и {n_classes}."
-            )
+            raise ModelConfigError(f"Голове нужны d_model и хотя бы 2 класса, пришло {d_model}, {n_classes}.")
         self.linear = nn.Linear(d_model, n_classes)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, token: torch.Tensor) -> torch.Tensor:
-        """Превратить токен ``[B, D]`` в вероятности ``[B, n_classes]``."""
+    def forward(self, token):
         return self.softmax(self.linear(token))
 
 
 class BENDREncoder(nn.Module):
-    """Свёрточный фронт-энд и трансформер BENDR.
+    """Шесть (или сколько в конфиге) свёрток и трансформер.
 
-    Каждый свёрточный блок — ``Conv1d`` без дополнения и без смещения,
-    затем ``GroupNorm`` и ``GELU``. Смещение не нужно: его забирает нормализация.
-    Dropout внутри трансформера выключен, отдельного значения в конфиге нет.
-    Каналы отключает только ``ChannelDropout``.
-    Ядро и шаг блока совпадают: их произведение должно равняться
-    ``model.downsample_factor``. После проекции к ``d_model`` в начало
-    последовательности добавляется обучаемый стартовый токен. Его и читает
-    голова, когда ``model.use_first_token`` истинно.
+    В каждом блоке: Conv1d, ChannelDropout, GroupNorm, GELU.
+    Шаг свёртки равен ядру, произведение шагов — downsample_factor.
     """
 
     def __init__(
         self,
-        in_channels: int,
-        conv_filters: int,
-        kernels: tuple[int, ...],
-        group_norm_groups: int,
-        channel_dropout_p: float,
-        d_model: int,
-        n_layers: int,
-        n_heads: int,
-        ff_dim: int,
-    ) -> None:
+        in_channels,
+        conv_filters,
+        kernels,
+        group_norm_groups,
+        channel_dropout_p,
+        d_model,
+        n_layers,
+        n_heads,
+        ff_dim,
+        relative_pos_kernel=25,
+        relative_pos_groups=16,
+    ):
         super().__init__()
         if in_channels < 1:
             raise ModelConfigError(f"Число входных каналов должно быть положительным, получено: {in_channels}.")
@@ -103,14 +67,15 @@ class BENDREncoder(nn.Module):
                 f"group_norm_groups={group_norm_groups} не делит число фильтров {conv_filters}."
             )
 
-        self.kernels = kernels
-        self.channel_dropout = ChannelDropout(channel_dropout_p)
-        blocks: list[nn.Module] = []
+        self.kernels = tuple(kernels)
+        blocks = []
         incoming = in_channels
-        for kernel in kernels:
+        for kernel in self.kernels:
+            # NOTE: stride = kernel. Произведение [3,2,2,2,2,2] как раз 96, не разъезжать списки
             blocks.append(
                 nn.Sequential(
                     nn.Conv1d(incoming, conv_filters, kernel_size=kernel, stride=kernel, bias=False),
+                    ChannelDropout(channel_dropout_p),
                     nn.GroupNorm(group_norm_groups, conv_filters),
                     nn.GELU(),
                 )
@@ -119,6 +84,8 @@ class BENDREncoder(nn.Module):
         self.frontend = nn.Sequential(*blocks)
         self.projection = nn.Linear(conv_filters, d_model)
         self.start_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.relative_position = RelativePosition(d_model, relative_pos_kernel, relative_pos_groups)
+        # TODO: T-fixup из статьи ещё не включён, инициализация пока штатная от PyTorch
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -128,15 +95,17 @@ class BENDREncoder(nn.Module):
             batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
+        # FIXME: ChannelDropout стоит после свёртки, так что глушит карты признаков, не сырые электроды
 
-    def forward(self, signal: torch.Tensor) -> torch.Tensor:
-        """Закодировать ``[B, C, T]`` в последовательность ``[B, 1 + T', D]``."""
-        features = self.frontend(self.channel_dropout(signal))
+    def forward(self, signal):
+        features = self.frontend(signal)
         if features.shape[-1] < 1:
             raise ModelConfigError("Свёртки съели временную ось: увеличьте длину окна или уменьшите шаги.")
         tokens = self.projection(features.transpose(1, 2))
         start = self.start_token.expand(tokens.shape[0], -1, -1)
-        return self.transformer(torch.cat((start, tokens), dim=1))
+        tokens = torch.cat((start, tokens), dim=1)
+        tokens = tokens + self.relative_position(tokens)
+        return self.transformer(tokens)
 
 
 class BENDRClassifier(nn.Module):
@@ -162,20 +131,14 @@ class BENDRClassifier(nn.Module):
             n_layers=spec.n_layers,
             n_heads=spec.n_heads,
             ff_dim=int(model["ff_dim"]),
+            relative_pos_kernel=int(model.get("relative_pos_kernel", 25)),
+            relative_pos_groups=int(model.get("relative_pos_groups", 16)),
         )
         self.head = ClassificationHead(int(model["d_model"]), int(model["n_classes"]))
         self._weight_names = _weight_names(config)
 
-    def forward(self, signal: torch.Tensor) -> torch.Tensor:
-        """Вернуть вероятности классов для батча окон.
-
-        Args:
-            signal: Тензор ``[B, C, T]``. Число каналов должно совпасть
-                с ``data.n_channels_out`` либо с длиной ``bendr_order``.
-
-        Returns:
-            Тензор вероятностей ``[B, n_classes]``.
-        """
+    def forward(self, signal):
+        """Батч [B, C, T] -> вероятности [B, 2]."""
         if signal.ndim != 3:
             raise ModelConfigError(f"Ожидался батч [B, C, T], получено ndim={signal.ndim}.")
         if signal.shape[1] != self.n_channels:
@@ -183,7 +146,8 @@ class BENDRClassifier(nn.Module):
                 f"В батче {signal.shape[1]} каналов, архитектура собрана на {self.n_channels}."
             )
         encoded = self.encoder(signal)
-        token = encoded[:, 0] if self.use_first_token else encoded[:, 1:].mean(dim=1)
+        # первый токен — стартовый. Иначе среднее по всей последовательности
+        token = encoded[:, 0] if self.use_first_token else encoded.mean(dim=1)
         return self.head(token)
 
     def load_pretrained(self, path: str | Path) -> None:
