@@ -230,7 +230,14 @@ def test_default_config_locks_task_values() -> None:
         "low_hz": 0.5,
         "high_hz": 50.0,
     }
-    assert config["data"]["channels"]["tueg_keep"] is None
+    mapping = config["data"]["channels"]["mapping"]
+    bendr_order = config["data"]["channels"]["bendr_order"]
+    assert list(mapping) == bendr_order
+    assert len(mapping) == 20
+    assert bendr_order[-1] == "SCALE"
+    assert config["data"]["channels"]["drop"] == ["FT9-FT10", "FT10-T8"]
+    assert list(mapping.values()).count("T8-P8") == 1
+    assert "FT9-FT10" not in mapping.values()
     assert config["data"]["channels"]["chb01_reference"].count("T8-P8") == 2
 
     assert config["model"]["conv_filters"] == 512
@@ -239,7 +246,8 @@ def test_default_config_locks_task_values() -> None:
     assert config["model"]["d_model"] == 1536
     assert config["model"]["ff_dim"] == 3076
     assert config["model"]["channel_dropout_p"] == 0.5
-    assert config["model"]["scale"] == "55%"
+    assert config["model"]["group_norm_groups"] == 256
+    assert config["model"]["scale"] == "100%"
     assert config["model"]["scales"]["100%"] == {
         "conv_blocks": 6,
         "transformer_layers": 8,
@@ -264,8 +272,10 @@ def test_default_config_locks_task_values() -> None:
     assert config["training"]["max_epochs"] == 120
     assert config["training"]["early_stopping_patience"] == 15
     assert config["training"]["scheduler_patience"] == 5
-    assert config["training"]["batch_size_cpu"] is None
-    assert config["training"]["lopo"]["val_fraction"] is None
+    assert config["training"]["batch_size_cpu"] == 8
+    assert config["training"]["lopo"]["val_fraction"] == pytest.approx(0.2)
+    assert config["training"]["lopo"]["stratify"] is True
+    assert config["training"]["lopo"]["split_unit"] == "window"
     assert config["postprocessing"]["smoothing"]["window"] == 3
     assert config["metrics"]["targets"]["fp_per_hour_max"] == 1.0
 

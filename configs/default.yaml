@@ -1,7 +1,6 @@
 # Конфигурация системы детекции эпилептических приступов на основе BENDR.
-# Числа ниже взяты из постановки задачи. Поля со значением null в задании
-# не определены и сознательно не заполнены.
-# Масштаб модели задаётся ключом model.scale, а не хардкодом в исходниках.
+# Параметры обучения — из диссертации Benfenati (Politecnico di Torino, 2022–2023)
+# и из постановки задачи. Масштаб модели задаётся ключом model.scale.
 
 seed: 42
 
@@ -65,8 +64,6 @@ data:
     method: weighted_random_sampling
   channels:
     # Эталонный биполярный монтаж chb01 по официальной сводке PhysioNet.
-    # У других пациентов список берётся из их summary: он бывает длиннее 23
-    # и может содержать «-» и канал ECG.
     chb01_reference:
       - FP1-F7
       - F7-T7
@@ -91,14 +88,70 @@ data:
       - FT9-FT10
       - FT10-T8
       - T8-P8
-    # Какие именно 20 каналов оставить под предобучение на TUEG, в задании не названы.
-    tueg_keep: null
+    # Порядок 20 каналов предобучения BENDR: 19 электродов 10–20 из
+    # dn3.transforms.instance.To1020.EEG_20_div и канал SCALE
+    # (относительная амплитуда, To1020(include_scale_ch=True)).
+    bendr_order:
+      - FP1
+      - FP2
+      - F7
+      - F3
+      - FZ
+      - F4
+      - F8
+      - T7
+      - C3
+      - CZ
+      - C4
+      - T8
+      - T5
+      - P3
+      - PZ
+      - P4
+      - T6
+      - O1
+      - O2
+      - SCALE
+    # Диссертация оставляет 20 из 23 каналов CHB-MIT и переименовывает их
+    # под TUEG. Таблицы пар в тексте диссертации нет. Здесь отброшены два
+    # отведения FT9/FT10, которых нет в схеме 10–20, и второй экземпляр
+    # T8-P8. Оставшиеся 20 каналов в порядке сводки chb01 занимают слоты
+    # bendr_order. Это порядок слотов, а не геометрическое соответствие
+    # электродов: словарь можно править до реализации конвейера.
+    drop:
+      - FT9-FT10
+      - FT10-T8
+    drop_later_duplicates: true
+    mapping:
+      FP1: FP1-F7
+      FP2: F7-T7
+      F7: T7-P7
+      F3: P7-O1
+      FZ: FP1-F3
+      F4: F3-C3
+      F8: C3-P3
+      T7: P3-O1
+      C3: FP2-F4
+      CZ: F4-C4
+      C4: C4-P4
+      T8: P4-O2
+      T5: FP2-F8
+      P3: F8-T8
+      PZ: T8-P8
+      P4: P8-O2
+      T6: FZ-CZ
+      O1: CZ-PZ
+      O2: P7-T7
+      SCALE: T7-FT9
 
 model:
-  scale: "55%"
+  # Активная архитектура этого задания: 6 свёрточных блоков, 8 слоёв и 8 голов.
+  scale: "100%"
   conv_filters: 512
   conv_kernels: [3, 2, 2, 2, 2, 2]
   downsample_factor: 96
+  # ConvEncoderBENDR: GroupNorm(encoder_h // 2, encoder_h) при encoder_h = 512.
+  group_norm_groups: 256
   channel_dropout_p: 0.5
   activation: gelu
   d_model: 1536
@@ -142,13 +195,15 @@ training:
   early_stopping_patience: 15
   early_stopping_min_delta: 0.0001
   batch_size: 256
-  # Уменьшенный размер батча для отладки на CPU в задании числом не задан.
-  batch_size_cpu: null
+  # Отладочный батч на CPU. В диссертации число не зафиксировано.
+  batch_size_cpu: 8
   max_epochs: 120
   freeze_encoder: false
   lopo:
-    # Доля валидации внутри 22 пациентов в задании не задана.
-    val_fraction: null
+    # 22 пациента делятся 80/20. Доля валидации — 0.2, стратификация по метке окна.
+    val_fraction: 0.2
+    stratify: true
+    split_unit: window
   logging:
     tensorboard: true
     wandb: false

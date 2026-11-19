@@ -24,6 +24,8 @@ wandb/
 *.edf
 *.edf+
 *.fif
+*.npy
+*.npz
 *.pt
 *.pth
 *.ckpt
