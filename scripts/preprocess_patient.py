@@ -34,11 +34,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.preprocessing.annotations import AnnotationParseError, EdfRecord, PatientSummary, parse_summary
-from src.preprocessing.channel_mapping import ChannelMappingError, map_channels
+from src.preprocessing.channel_mapping import MappingError, map_channels
 from src.preprocessing.edf_loader import EdfLoadError, EdfRecording, load_edf
-from src.preprocessing.filtering import FilterError, apply_bandpass_filter
-from src.preprocessing.normalization import EEGNormalizer, NormalizerError
-from src.preprocessing.segmentation import SegmentationError, segment_and_label
+from src.preprocessing.filtering import FilterError, bandpass_filter
+from src.preprocessing.normalization import Normalizer, NormalizerError
+from src.preprocessing.segmentation import SegmentationError, make_windows
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -158,12 +158,12 @@ def _run_pipeline(
         for record, edf_path in iterator:
             recording = load_edf(edf_path, target_sfreq)
             mapped = map_channels(recording.data, recording.channel_names, config)
-            filtered = apply_bandpass_filter(mapped, recording.sfreq, config)
-            windows, labels = segment_and_label(filtered, recording.sfreq, record.seizures, config)
+            filtered = bandpass_filter(mapped, recording.sfreq, config)
+            windows, labels = make_windows(filtered, recording.sfreq, record.seizures, config)
             if len(labels):
                 windows_list.append(windows)
                 labels_list.append(labels)
-    except (ChannelMappingError, FilterError, SegmentationError, EdfLoadError, OSError, ValueError) as exc:
+    except (MappingError, FilterError, SegmentationError, EdfLoadError, OSError, ValueError, RuntimeError) as exc:
         print(f"Ошибка предобработки: {exc}", file=sys.stderr)
         return 1
 
@@ -174,7 +174,7 @@ def _run_pipeline(
     windows = np.concatenate(windows_list, axis=0)
     labels = np.concatenate(labels_list, axis=0)
     try:
-        normalized = EEGNormalizer(config).fit_transform(windows)
+        normalized = Normalizer(config).fit_transform(windows)
     except NormalizerError as exc:
         print(f"Ошибка нормализации: {exc}", file=sys.stderr)
         return 1

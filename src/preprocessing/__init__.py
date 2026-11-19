@@ -1,4 +1,4 @@
-"""Предварительная обработка многоканальной ЭЭГ (EEG)."""
+"""Предобработка ЭЭГ: сводки, EDF, каналы, фильтр, окна, нормализация."""
 
 from src.preprocessing.annotations import (
     AnnotationParseError,
@@ -8,28 +8,28 @@ from src.preprocessing.annotations import (
     parse_summary,
     parse_summary_text,
 )
-from src.preprocessing.channel_mapping import ChannelMappingError, map_channels
+from src.preprocessing.channel_mapping import MappingError, map_channels
 from src.preprocessing.edf_loader import EdfLoadError, EdfRecording, load_edf
-from src.preprocessing.filtering import FilterError, apply_bandpass_filter
-from src.preprocessing.normalization import EEGNormalizer, NormalizerError
-from src.preprocessing.segmentation import SegmentationError, segment_and_label
+from src.preprocessing.filtering import FilterError, bandpass_filter
+from src.preprocessing.normalization import Normalizer, NormalizerError
+from src.preprocessing.segmentation import SegmentationError, make_windows
 
 __all__ = [
     "AnnotationParseError",
-    "ChannelMappingError",
-    "EEGNormalizer",
     "EdfLoadError",
     "EdfRecord",
     "EdfRecording",
     "FilterError",
+    "MappingError",
+    "Normalizer",
     "NormalizerError",
     "PatientSummary",
     "SegmentationError",
     "SeizureInterval",
-    "apply_bandpass_filter",
+    "bandpass_filter",
     "load_edf",
+    "make_windows",
     "map_channels",
     "parse_summary",
     "parse_summary_text",
-    "segment_and_label",
 ]

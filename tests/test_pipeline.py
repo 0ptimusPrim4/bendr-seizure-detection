@@ -11,10 +11,10 @@ import pytest
 import yaml
 
 from src.preprocessing.annotations import SeizureInterval
-from src.preprocessing.channel_mapping import ChannelMappingError, map_channels
-from src.preprocessing.filtering import FilterError, apply_bandpass_filter
-from src.preprocessing.normalization import EEGNormalizer
-from src.preprocessing.segmentation import SegmentationError, segment_and_label
+from src.preprocessing.channel_mapping import MappingError, map_channels
+from src.preprocessing.filtering import FilterError, bandpass_filter
+from src.preprocessing.normalization import Normalizer
+from src.preprocessing.segmentation import SegmentationError, make_windows
 from src.training.lopo_cv import LopoSplitError, collect_windows, generate_lopo_splits
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -79,7 +79,7 @@ def test_map_channels_drops_extras_and_second_duplicate() -> None:
 def test_map_channels_missing_slot_raises() -> None:
     config = _config()
     config["data"]["channels"]["mapping"]["SCALE"] = "NO-SUCH"
-    with pytest.raises(ChannelMappingError, match="SCALE"):
+    with pytest.raises(MappingError, match="SCALE"):
         map_channels(_signal(), CHB_NAMES, config)
 
 
@@ -102,7 +102,7 @@ def test_bandpass_keeps_10hz_and_rejects_100hz() -> None:
             np.sin(2 * np.pi * 100 * time),
         ]
     )
-    filtered = apply_bandpass_filter(data, sfreq, _config())
+    filtered = bandpass_filter(data, sfreq, _config())
     middle = slice(int(sfreq), -int(sfreq))
     kept = np.std(filtered[0, middle])
     removed = np.std(filtered[1, middle])
@@ -114,7 +114,7 @@ def test_bandpass_keeps_10hz_and_rejects_100hz() -> None:
 
 def test_filter_rejects_wrong_sampling_rate() -> None:
     with pytest.raises(FilterError, match="не совпадает"):
-        apply_bandpass_filter(np.zeros((1, 2048), dtype=np.float32), 128.0, _config())
+        bandpass_filter(np.zeros((1, 2048), dtype=np.float32), 128.0, _config())
 
 
 def test_segment_labels_seizure_and_drops_postictal() -> None:
@@ -126,7 +126,7 @@ def test_segment_labels_seizure_and_drops_postictal() -> None:
     data = np.ones((20, window * 4), dtype=np.float32)
     seizures = [SeizureInterval(index=1, start_sec=4.0, end_sec=8.0)]
 
-    windows, labels = segment_and_label(data, sfreq, seizures, config)
+    windows, labels = make_windows(data, sfreq, seizures, config)
 
     assert windows.shape == (3, 20, window)
     np.testing.assert_array_equal(labels, np.array([0, 1, 0], dtype=np.int64))
@@ -144,7 +144,7 @@ def test_segment_keeps_later_seizure_inside_postictal_gap() -> None:
         SeizureInterval(index=2, start_sec=8.0, end_sec=12.0),
     ]
 
-    windows, labels = segment_and_label(data, sfreq, seizures, config)
+    windows, labels = make_windows(data, sfreq, seizures, config)
 
     np.testing.assert_array_equal(labels, np.array([1, 1], dtype=np.int64))
     assert windows.shape[0] == 2
@@ -158,7 +158,7 @@ def test_segment_keeps_short_seizure_that_spills_into_postictal() -> None:
     data = np.ones((20, window), dtype=np.float32)
     seizures = [SeizureInterval(index=1, start_sec=0.0, end_sec=2.0)]
 
-    windows, labels = segment_and_label(data, sfreq, seizures, config)
+    windows, labels = make_windows(data, sfreq, seizures, config)
 
     assert windows.shape == (1, 20, window)
     np.testing.assert_array_equal(labels, np.array([1], dtype=np.int64))
@@ -167,7 +167,7 @@ def test_segment_keeps_short_seizure_that_spills_into_postictal() -> None:
 def test_segment_rejects_wrong_sampling_rate() -> None:
     data = np.ones((20, 2048), dtype=np.float32)
     with pytest.raises(SegmentationError, match="не совпадает"):
-        segment_and_label(data, 128.0, [], _config())
+        make_windows(data, 128.0, [], _config())
 
 
 def test_normalizer_uses_only_train_statistics() -> None:
@@ -178,7 +178,7 @@ def test_normalizer_uses_only_train_statistics() -> None:
     train[:, 1, :] = 2.0
     test = np.zeros((3, 2, 8), dtype=np.float32)
 
-    normalizer = EEGNormalizer(config)
+    normalizer = Normalizer(config)
     transformed_train = normalizer.fit_transform(train)
     transformed_test = normalizer.transform(test)
 
@@ -194,7 +194,7 @@ def test_normalizer_minmax_scales_train_range() -> None:
     train = np.zeros((2, 1, 4), dtype=np.float32)
     train[0] = 0.0
     train[1] = 10.0
-    normalizer = EEGNormalizer(config)
+    normalizer = Normalizer(config)
     scaled = normalizer.fit_transform(train)
 
     assert scaled.min() == pytest.approx(0.0)

@@ -1,74 +1,46 @@
-"""Сопоставление каналов CHB-MIT с 20 слотами предобучения BENDR.
+"""20 слотов BENDR из каналов CHB-MIT.
 
-Из записи выбрасываются каналы из ``channels.drop``. При
-``drop_later_duplicates: true`` у повторяющегося имени остаётся первое
-вхождение: в chb01 второй ``T8-P8`` не попадает в модель. Оставшиеся строки
-раскладываются по ``channels.bendr_order`` через словарь ``channels.mapping``.
+Кого выкинуть и куда положить — только из конфига, здесь нет своей таблицы.
 """
-
-from __future__ import annotations
-
-from collections.abc import Sequence
 
 import numpy as np
 
 from src.config_lookup import require_section
 
 
-class ChannelMappingError(ValueError):
-    """Каналы записи нельзя разложить по словарю BENDR."""
+class MappingError(ValueError):
+    """Каналы записи не лезут в словарь BENDR."""
 
 
-def map_channels(
-    data: np.ndarray,
-    original_names: tuple[str, ...] | list[str],
-    config: dict,
-) -> np.ndarray:
-    """Привести сигнал к порядку каналов предобучения BENDR.
-
-    Args:
-        data: Массив ``[C, T]`` в исходном порядке электродов.
-        original_names: Имена каналов, по одному на строку ``data``.
-        config: Полный конфиг или раздел ``channels``.
-
-    Returns:
-        Массив ``[len(bendr_order), T]``. Для конфига по умолчанию это ``[20, T]``.
-
-    Raises:
-        ChannelMappingError: Несовпадение формы, пустой словарь или отсутствующий
-            канал при ``on_missing: error``.
+def map_channels(data, original_names, config):
+    """Выкидывает лишние каналы и раскладывает остальные по bendr_order.
+    На выходе [20, T], если в конфиге 20 слотов.
     """
     channels = require_section(config, "channels")
     signal = np.asarray(data)
     if signal.ndim != 2:
-        raise ChannelMappingError(
-            f"Ожидался массив каналов формы [C, T], получено ndim={signal.ndim}."
-        )
+        raise MappingError(f"Ожидался массив каналов формы [C, T], получено ndim={signal.ndim}.")
     names = tuple(str(name) for name in original_names)
     if signal.shape[0] != len(names):
-        raise ChannelMappingError(
+        raise MappingError(
             f"Число строк сигнала ({signal.shape[0]}) не совпало с числом имён ({len(names)})."
         )
     if signal.shape[1] == 0:
-        raise ChannelMappingError("В записи нет временных отсчётов.")
+        raise MappingError("В записи нет временных отсчётов.")
 
     order = tuple(str(name) for name in channels["bendr_order"])
     mapping = {str(slot): str(source) for slot, source in dict(channels["mapping"]).items()}
     missing_slots = [slot for slot in order if slot not in mapping]
     if missing_slots:
-        raise ChannelMappingError(
-            "В channels.mapping нет слотов BENDR: " + ", ".join(missing_slots) + "."
-        )
+        raise MappingError("В channels.mapping нет слотов BENDR: " + ", ".join(missing_slots) + ".")
 
     available = _available_indexes(names, channels)
     on_missing = str(channels.get("on_missing", "error")).strip().lower()
     if on_missing not in {"error", "zero"}:
-        raise ChannelMappingError(
-            f"channels.on_missing должен быть «error» или «zero», получено: {on_missing}."
-        )
+        raise MappingError(f"channels.on_missing должен быть «error» или «zero», получено: {on_missing}.")
 
-    rows: list[np.ndarray] = []
-    absent: list[str] = []
+    rows = []
+    absent = []
     for slot in order:
         source = mapping[slot]
         index = available.get(_normalize_name(source))
@@ -80,25 +52,24 @@ def map_channels(
 
     if absent and on_missing == "error":
         present = ", ".join(names) if names else "нет каналов"
-        raise ChannelMappingError(
-            "Не найдены каналы для слотов: "
-            + "; ".join(absent)
-            + f". В записи есть: {present}."
+        raise MappingError(
+            "Не найдены каналы для слотов: " + "; ".join(absent) + f". В записи есть: {present}."
         )
 
     mapped = np.stack(rows, axis=0)
     expected = _expected_channels(config)
     if expected is not None and mapped.shape[0] != expected:
-        raise ChannelMappingError(
+        raise MappingError(
             f"После сопоставления каналов {mapped.shape[0]}, а data.n_channels_out = {expected}."
         )
     return mapped
 
 
-def _available_indexes(names: Sequence[str], channels: dict) -> dict[str, int]:
+def _available_indexes(names, channels):
     drop = {_normalize_name(name) for name in channels.get("drop", [])}
+    # NOTE: в chb01 T8-P8 записан дважды, берём первое вхождение
     drop_duplicates = bool(channels.get("drop_later_duplicates", False))
-    available: dict[str, int] = {}
+    available = {}
     for index, name in enumerate(names):
         key = _normalize_name(name)
         if not key or key in drop:
@@ -109,7 +80,7 @@ def _available_indexes(names: Sequence[str], channels: dict) -> dict[str, int]:
     return available
 
 
-def _expected_channels(config: dict) -> int | None:
+def _expected_channels(config):
     data = config.get("data")
     if isinstance(data, dict) and "n_channels_out" in data:
         return int(data["n_channels_out"])
@@ -118,5 +89,10 @@ def _expected_channels(config: dict) -> int | None:
     return None
 
 
-def _normalize_name(name: str) -> str:
+def _normalize_name(name):
+    # hack: в заголовках EDF пробелы и регистр гуляют, сравниваем сжатую строку
     return " ".join(str(name).strip().upper().split())
+
+
+# TODO: SCALE в диссертации — не электрод, а статистика амплитуды. Пока кладём то, что прописано в mapping
+# FIXME: пара FT9-FT10 выкидывается по имени из конфига. Другой монтаж с теми же электродами не поймаем

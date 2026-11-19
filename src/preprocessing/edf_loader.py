@@ -1,79 +1,44 @@
-"""Чтение многоканальных записей ЭЭГ (EEG) в формате EDF через MNE.
-
-Загрузчик возвращает сигнал в форме ``[C, T]`` (каналы, отсчёты) и приводит
-частоту дискретизации (sampling rate) к значению из конфигурации. Имена каналов
-читаются из заголовка EDF без переименования дубликатов: в CHB-MIT канал
-``T8-P8`` встречается дважды, и это разные строки монтажа.
-"""
-
-from __future__ import annotations
+"""Чтение EDF. Сигнал наружу отдаём как [C, T]."""
 
 import math
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+# NOTE: частота 256 Гц для CHB-MIT почти всегда такая, но лучше проверять
 _SFREQ_ATOL = 1e-3
 
 
 class EdfLoadError(RuntimeError):
-    """EDF-файл не удалось прочитать или привести к целевой частоте."""
+    """Файл прочитался, но частота или форма сигнала никуда не годятся."""
 
 
-@dataclass
 class EdfRecording:
-    """Сигнал одного EDF-файла после приведения частоты.
+    """Контейнер для прочитанного EDF."""
 
-    Attributes:
-        data: Массив ``float32`` формы ``[C, T]``.
-        channel_names: Имена каналов в порядке строк ``data``. Дубликаты сохраняются.
-        sfreq: Частота дискретизации после приведения, Гц.
-        source_sfreq: Частота в исходном файле, Гц.
-        path: Путь к прочитанному файлу.
-    """
-
-    data: np.ndarray
-    channel_names: tuple[str, ...]
-    sfreq: float
-    source_sfreq: float
-    path: Path
+    def __init__(self, data, channel_names, sfreq, source_sfreq, path):
+        self.data = data
+        self.channel_names = channel_names
+        self.sfreq = sfreq
+        self.source_sfreq = source_sfreq
+        self.path = path
 
     @property
-    def n_channels(self) -> int:
-        """Число каналов."""
+    def n_channels(self):
         return int(self.data.shape[0])
 
     @property
-    def n_samples(self) -> int:
-        """Число отсчётов на канал."""
+    def n_samples(self):
         return int(self.data.shape[1])
 
     @property
-    def duration_sec(self) -> float:
-        """Длительность записи в секундах."""
+    def duration_sec(self):
         return self.n_samples / self.sfreq
 
 
-def load_edf(path: str | Path, target_sfreq: float) -> EdfRecording:
-    """Прочитать EDF и привести частоту дискретизации к ``target_sfreq``.
-
-    Если файл уже записан на целевой частоте, передискретизация (resampling)
-    не выполняется, чтобы не менять отсчёты. Иначе используется передискретизация
-    MNE. Целевая частота задаётся вызывающим кодом из ``configs/default.yaml``
-    и здесь не зафиксирована числом по умолчанию.
-
-    Args:
-        path: Путь к ``.edf``.
-        target_sfreq: Желаемая частота дискретизации, Гц. Для CHB-MIT это 256.
-
-    Returns:
-        Запись с сигналом ``[C, T]`` и исходными именами каналов.
-
-    Raises:
-        FileNotFoundError: Файл не существует.
-        ValueError: Целевая частота не является положительным числом.
-        EdfLoadError: Файл повреждён, пуст или не приводится к целевой частоте.
+def load_edf(path, target_sfreq):
+    """Читает EDF и ресемплит к нужной частоте.
+    Если частота уже правильная — пропускает ресемплинг, чтобы не портить отсчёты.
     """
     edf_path = Path(path)
     if not edf_path.exists():
@@ -88,6 +53,7 @@ def load_edf(path: str | Path, target_sfreq: float) -> EdfRecording:
 
     raw, source_sfreq = _read_with_mne(edf_path)
     try:
+        # TODO: mne слишком медленный для больших файлов, перейти на pyedflib
         if abs(source_sfreq - target_sfreq) > _SFREQ_ATOL:
             raw.resample(target_sfreq, verbose="ERROR")
         achieved = float(raw.info["sfreq"])
@@ -97,13 +63,14 @@ def load_edf(path: str | Path, target_sfreq: float) -> EdfRecording:
                 f"не совпала с целевой {target_sfreq} Гц."
             )
         data = np.ascontiguousarray(raw.get_data(), dtype=np.float32)
-        mne_names = tuple(str(name).strip() for name in raw.ch_names)
+        mne_names = tuple(name.strip() for name in raw.ch_names)
     finally:
         raw.close()
 
     if data.ndim != 2 or data.shape[0] == 0 or data.shape[1] == 0:
         raise EdfLoadError(f"EDF-файл {edf_path.name} не содержит сигнала.")
 
+    # hack: mne переименовывает дубликаты каналов, поэтому читаем заголовок отдельно через pyedflib
     channel_names = _read_original_labels(edf_path, fallback=mne_names)
     if len(channel_names) != data.shape[0]:
         raise EdfLoadError(
@@ -111,27 +78,23 @@ def load_edf(path: str | Path, target_sfreq: float) -> EdfRecording:
             f"не совпало с числом строк сигнала ({data.shape[0]})."
         )
 
-    return EdfRecording(
-        data=data,
-        channel_names=channel_names,
-        sfreq=achieved,
-        source_sfreq=source_sfreq,
-        path=edf_path,
-    )
+    return EdfRecording(data, channel_names, achieved, source_sfreq, edf_path)
 
 
-def _read_with_mne(path: Path) -> tuple[object, float]:
+def _read_with_mne(path):
     try:
         import mne
-    except ImportError as exc:  # pragma: no cover - зависимость объявлена в requirements
+    except ImportError as e:
         raise EdfLoadError(
             "Для чтения EDF нужен пакет mne. Установите зависимости: pip install -r requirements.txt"
-        ) from exc
+        ) from e
 
     try:
+        # mne без verbose печатает warning на каждый дубликат T8-P8
         raw = mne.io.read_raw_edf(path, preload=True, verbose="ERROR")
-    except Exception as exc:
-        raise EdfLoadError(f"Не удалось прочитать EDF {path}: {exc}") from exc
+    except Exception as e:
+        # FIXME: падает на файлах с битыми заголовками (встречаются в chb15)
+        raise RuntimeError(f"Не могу прочитать {path}: {e}") from e
 
     source_sfreq = float(raw.info["sfreq"])
     if not math.isfinite(source_sfreq) or source_sfreq <= 0:
@@ -140,14 +103,8 @@ def _read_with_mne(path: Path) -> tuple[object, float]:
     return raw, source_sfreq
 
 
-def _read_original_labels(path: Path, fallback: tuple[str, ...]) -> tuple[str, ...]:
-    """Вернуть подписи каналов из заголовка EDF, сохраняя дубликаты.
-
-    MNE делает имена уникальными и может переименовать второй ``T8-P8``.
-    Для сопоставления каналов нужны исходные подписи, поэтому заголовок
-    читается отдельно через pyedflib. Если заголовок недоступен, остаются
-    имена MNE.
-    """
+def _read_original_labels(path, fallback):
+    """Подписи из заголовка EDF. Если pyedflib не открыл файл — остаются имена MNE."""
     try:
         import pyedflib
     except ImportError:

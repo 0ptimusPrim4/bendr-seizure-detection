@@ -1,51 +1,22 @@
-"""Нарезка ЭЭГ на окна и разметка приступов.
+"""Нарезка на окна без перекрытия и метки 0/1.
 
-Окна не перекрываются. Длина окна и длина постиктального исключения
-(post-ictal exclusion) берутся из раздела ``data`` конфига. Окно с приступом
-сохраняется с меткой 1, даже если оно задевает начало постиктального периода:
-иначе короткий хвост приступа пропал бы. Окно без приступа, попавшее в
-15 минут после конца приступа, выбрасывается и не становится фоном.
+Постиктал после приступа выкидываем, но само окно с приступом оставляем,
+даже если оно чуть залезает за end_sec. Иначе короткий хвост пропадёт.
 """
-
-from __future__ import annotations
-
-from collections.abc import Sequence
 
 import numpy as np
 
 from src.config_lookup import require_section
-from src.preprocessing.annotations import SeizureInterval
 
 _SFREQ_ATOL = 1e-3
 
 
 class SegmentationError(ValueError):
-    """Запись нельзя разрезать на окна с текущим конфигом."""
+    """Окна из этой записи при таком конфиге не собрать."""
 
 
-def segment_and_label(
-    data: np.ndarray,
-    sfreq: float,
-    seizures: Sequence[SeizureInterval],
-    config: dict,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Разрезать сигнал на окна и разметить пересечение с приступами.
-
-    Args:
-        data: Сигнал ``[C, T]`` после сопоставления каналов и фильтра.
-        sfreq: Частота дискретизации, Гц.
-        seizures: Интервалы приступов этого файла, в секундах от его начала.
-        config: Полный конфиг или раздел ``data``.
-
-    Returns:
-        Кортеж ``(windows, labels)``. ``windows`` имеет форму ``[N, C, window]``,
-        ``labels`` — форму ``[N]`` со значениями 0 (фон) и 1 (приступ).
-        Неполное последнее окно отбрасывается. Если целых окон не осталось,
-        ``N = 0``.
-
-    Raises:
-        SegmentationError: Частота, длина окна или форма сигнала не подходят.
-    """
+def make_windows(data, sfreq, seizures, config):
+    """Режет [C, T] на [N, C, window] и метки [N]. Хвост короче окна выбрасывает."""
     section = require_section(config, "data")
     signal = np.asarray(data, dtype=np.float32)
     if signal.ndim != 2:
@@ -56,6 +27,7 @@ def segment_and_label(
 
     _check_sampling_rate(sfreq, section)
     window = _window_samples(section, float(sfreq))
+    # 15 минут в конфиге, здесь только перевод в отсчёты
     exclusion = int(round(float(section["postictal_exclusion_min"]) * 60.0 * float(sfreq)))
     if exclusion < 0:
         raise SegmentationError("postictal_exclusion_min не может быть отрицательным.")
@@ -63,15 +35,14 @@ def segment_and_label(
     seizure_ranges = _sample_ranges(seizures, float(sfreq), n_samples)
     exclusion_ranges = _exclusion_ranges(seizure_ranges, exclusion, n_samples)
 
-    windows: list[np.ndarray] = []
-    labels: list[int] = []
+    windows = []
+    labels = []
     for start in range(0, n_samples - window + 1, window):
         stop = start + window
-        hits_seizure = _overlaps_any(start, stop, seizure_ranges)
-        hits_exclusion = _overlaps_any(start, stop, exclusion_ranges)
-        if hits_seizure:
+        # NOTE: пересечение с приступом важнее постиктала, иначе метка 1 теряется
+        if _overlaps_any(start, stop, seizure_ranges):
             label = 1
-        elif hits_exclusion:
+        elif _overlaps_any(start, stop, exclusion_ranges):
             continue
         else:
             label = 0
@@ -79,12 +50,12 @@ def segment_and_label(
         labels.append(label)
 
     if not windows:
-        empty = np.empty((0, n_channels, window), dtype=np.float32)
-        return empty, np.empty((0,), dtype=np.int64)
+        # FIXME: пустой результат — это (0, C, window), а не ошибка. Вызывающий может этого не ждать
+        return np.empty((0, n_channels, window), dtype=np.float32), np.empty((0,), dtype=np.int64)
     return np.stack(windows, axis=0), np.asarray(labels, dtype=np.int64)
 
 
-def _window_samples(section: dict, sfreq: float) -> int:
+def _window_samples(section, sfreq):
     window_sec = float(section["window_sec"])
     if window_sec <= 0:
         raise SegmentationError(f"window_sec должен быть положительным, получено: {window_sec}.")
@@ -97,7 +68,7 @@ def _window_samples(section: dict, sfreq: float) -> int:
     return window
 
 
-def _check_sampling_rate(sfreq: float, section: dict) -> None:
+def _check_sampling_rate(sfreq, section):
     if "sampling_rate_hz" not in section:
         if sfreq <= 0:
             raise SegmentationError(f"Частота дискретизации должна быть положительной, получено: {sfreq}.")
@@ -110,17 +81,11 @@ def _check_sampling_rate(sfreq: float, section: dict) -> None:
         )
 
 
-def _sample_ranges(
-    seizures: Sequence[SeizureInterval],
-    sfreq: float,
-    n_samples: int,
-) -> list[tuple[int, int]]:
-    ranges: list[tuple[int, int]] = []
+def _sample_ranges(seizures, sfreq, n_samples):
+    ranges = []
     for seizure in seizures:
-        start = int(np.floor(float(seizure.start_sec) * sfreq))
-        end = int(np.ceil(float(seizure.end_sec) * sfreq))
-        start = min(max(start, 0), n_samples)
-        end = min(max(end, 0), n_samples)
+        start = min(max(int(np.floor(float(seizure.start_sec) * sfreq)), 0), n_samples)
+        end = min(max(int(np.ceil(float(seizure.end_sec) * sfreq)), 0), n_samples)
         if end <= start:
             raise SegmentationError(
                 f"Приступ {seizure.start_sec}–{seizure.end_sec} с не попадает в запись."
@@ -129,12 +94,8 @@ def _sample_ranges(
     return ranges
 
 
-def _exclusion_ranges(
-    seizure_ranges: Sequence[tuple[int, int]],
-    exclusion_samples: int,
-    n_samples: int,
-) -> list[tuple[int, int]]:
-    """Постиктальные отрезки без отсчётов, которые сами принадлежат приступу."""
+def _exclusion_ranges(seizure_ranges, exclusion_samples, n_samples):
+    """Постиктал после end, но куски, которые сами являются приступом, не выкидываем."""
     raw = [(end, min(n_samples, end + exclusion_samples)) for _, end in seizure_ranges]
     raw = [(start, end) for start, end in raw if end > start]
     if not raw or not seizure_ranges:
@@ -142,13 +103,10 @@ def _exclusion_ranges(
     return _subtract(raw, seizure_ranges)
 
 
-def _subtract(
-    source: Sequence[tuple[int, int]],
-    cuts: Sequence[tuple[int, int]],
-) -> list[tuple[int, int]]:
+def _subtract(source, cuts):
     pieces = list(source)
     for cut_start, cut_end in cuts:
-        updated: list[tuple[int, int]] = []
+        updated = []
         for start, end in pieces:
             if cut_end <= start or cut_start >= end:
                 updated.append((start, end))
@@ -161,5 +119,8 @@ def _subtract(
     return pieces
 
 
-def _overlaps_any(start: int, stop: int, ranges: Sequence[tuple[int, int]]) -> bool:
+def _overlaps_any(start, stop, ranges):
     return any(start < end and stop > begin for begin, end in ranges)
+
+
+# TODO: дырки после выкинутого постиктала не склеиваем, иначе секунды приступов поедут

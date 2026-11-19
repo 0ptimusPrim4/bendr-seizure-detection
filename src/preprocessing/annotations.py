@@ -1,15 +1,6 @@
-"""Разбор сводок приступов CHB-MIT (``chbXX-summary.txt``).
-
-Из сводки извлекаются имена EDF-файлов, число приступов в каждом файле
-и интервалы приступов в секундах от начала записи. Дополнительно сохраняются
-частота дискретизации (sampling rate) и монтаж каналов, если они указаны:
-у части пациентов монтаж меняется между файлами.
-"""
-
-from __future__ import annotations
+"""Разбор chbXX-summary.txt: файлы, приступы в секундах, монтаж если он есть."""
 
 import re
-from dataclasses import dataclass
 from pathlib import Path
 
 _SAMPLING_RE = re.compile(
@@ -36,95 +27,68 @@ _SUMMARY_NAME_RE = re.compile(r"^(chb\d+)-summary$", re.IGNORECASE)
 
 
 class AnnotationParseError(ValueError):
-    """Сводка CHB-MIT не соответствует ожидаемому формату PhysioNet."""
+    """Сводка не похожа на формат PhysioNet."""
 
 
-@dataclass(frozen=True)
 class SeizureInterval:
-    """Один приступ внутри EDF-файла.
+    """Один приступ. Секунды от начала файла, не настенные часы."""
 
-    Время считается в секундах от начала этого файла, как в сводке,
-    а не по настенным часам.
-    """
-
-    index: int
-    start_sec: float
-    end_sec: float
+    def __init__(self, index, start_sec, end_sec):
+        self.index = index
+        self.start_sec = start_sec
+        self.end_sec = end_sec
 
     @property
-    def duration_sec(self) -> float:
-        """Длительность приступа в секундах."""
+    def duration_sec(self):
         return self.end_sec - self.start_sec
 
 
-@dataclass(frozen=True)
 class EdfRecord:
-    """Описание одного EDF-файла из сводки пациента."""
+    """Один EDF из сводки."""
 
-    file_name: str
-    start_time: str | None
-    end_time: str | None
-    n_seizures: int
-    seizures: tuple[SeizureInterval, ...]
-    channels: tuple[str, ...]
-
-    def __post_init__(self) -> None:
+    def __init__(self, file_name, start_time, end_time, n_seizures, seizures, channels):
+        self.file_name = file_name
+        self.start_time = start_time
+        self.end_time = end_time
+        self.n_seizures = n_seizures
+        self.seizures = tuple(seizures)
+        self.channels = tuple(channels)
         if self.n_seizures != len(self.seizures):
             raise AnnotationParseError(
                 f"В файле {self.file_name} число приступов ({self.n_seizures}) "
                 f"не совпадает с числом интервалов ({len(self.seizures)})."
             )
         if self.n_seizures < 0:
-            raise AnnotationParseError(
-                f"В файле {self.file_name} число приступов отрицательное."
-            )
+            raise AnnotationParseError(f"В файле {self.file_name} число приступов отрицательное.")
 
 
-@dataclass(frozen=True)
 class PatientSummary:
-    """Разобранная сводка одного пациента."""
+    """Сводка одного пациента."""
 
-    patient_id: str
-    sampling_rate_hz: float | None
-    files: tuple[EdfRecord, ...]
-    source: str
+    def __init__(self, patient_id, sampling_rate_hz, files, source):
+        self.patient_id = patient_id
+        self.sampling_rate_hz = sampling_rate_hz
+        self.files = tuple(files)
+        self.source = source
 
     @property
-    def n_files(self) -> int:
-        """Число EDF-файлов в сводке."""
+    def n_files(self):
         return len(self.files)
 
     @property
-    def n_seizure_files(self) -> int:
-        """Число файлов, в которых есть хотя бы один приступ."""
+    def n_seizure_files(self):
         return sum(1 for record in self.files if record.n_seizures > 0)
 
     @property
-    def n_seizures(self) -> int:
-        """Суммарное число приступов по всем файлам."""
+    def n_seizures(self):
         return sum(record.n_seizures for record in self.files)
 
-    def seizure_records(self) -> tuple[EdfRecord, ...]:
-        """Файлы, содержащие приступы, в порядке сводки."""
+    def seizure_records(self):
         return tuple(record for record in self.files if record.n_seizures > 0)
 
 
-def parse_summary(path: str | Path, patient_id: str | None = None) -> PatientSummary:
-    """Прочитать ``chbXX-summary.txt`` с диска.
-
-    Args:
-        path: Путь к сводке. По имени ``chbXX-summary.txt`` определяется пациент,
-            если ``patient_id`` не передан.
-        patient_id: Идентификатор пациента, например ``chb01``. Если не задан,
-            берётся из имени файла.
-
-    Returns:
-        Разобранная сводка.
-
-    Raises:
-        FileNotFoundError: Файл сводки не существует.
-        AnnotationParseError: Файл повреждён или формат не распознан.
-    """
+def parse_summary(path, patient_id=None):
+    """Читает сводку с диска. Пациента берёт из имени файла, если не передали."""
     summary_path = Path(path)
     if not summary_path.exists():
         raise FileNotFoundError(f"Файл сводки не найден: {summary_path}")
@@ -142,29 +106,11 @@ def parse_summary(path: str | Path, patient_id: str | None = None) -> PatientSum
     return parse_summary_text(text, patient_id=resolved_id, source_name=str(summary_path))
 
 
-def parse_summary_text(
-    text: str,
-    patient_id: str,
-    source_name: str = "<memory>",
-) -> PatientSummary:
-    """Разобрать уже прочитанный текст сводки.
+def parse_summary_text(text, patient_id, source_name="<memory>"):
+    """Разбирает текст сводки.
 
-    Поддерживаются оба варианта разметки PhysioNet: одна пара
-    ``Seizure Start/End Time`` и нумерованные ``Seizure N Start/End Time``.
-    Блоки ``Channels in EDF Files`` и ``Channels changed`` привязываются
-    к последующим файлам. Настенные часы начала и конца файла необязательны
-    (в сводке chb24 их нет).
-
-    Args:
-        text: Содержимое сводки.
-        patient_id: Идентификатор пациента, например ``chb17``.
-        source_name: Имя источника для сообщений об ошибках.
-
-    Returns:
-        Разобранная сводка.
-
-    Raises:
-        AnnotationParseError: Текст не является корректной сводкой.
+    Есть два формата PhysioNet: «Seizure Start Time» и «Seizure N Start Time».
+    Блок каналов относится к следующим файлам. Часы начала/конца бывают пустыми.
     """
     normalized_id = patient_id.strip().lower()
     if not normalized_id:
@@ -197,6 +143,7 @@ def parse_summary_text(
             continue
 
         lower = stripped.lower()
+        # NOTE: у chb12/chb24 монтаж меняется посередине файла, блок каналов надо сбросить
         if lower.startswith("channels in edf") or lower.startswith("channels changed"):
             finish_open_file()
             collecting_channels = True
@@ -378,6 +325,7 @@ def _pair_seizures(
         return ()
 
     indexes = [item[0] for item in starts] + [item[0] for item in ends]
+    # TODO: chb01 пишет приступы без номеров, chb04 — с номерами. Оба пути надо держать
     if all(index is None for index in indexes):
         intervals: list[SeizureInterval] = []
         for number, ((_, start_sec, _), (_, end_sec, _)) in enumerate(zip(starts, ends), start=1):
@@ -402,6 +350,7 @@ def _pair_seizures(
             fail(f"конец приступа {index} повторяется (строка {line_no}).")
         end_map[index] = end_sec
 
+    # FIXME: дырка в номерах (1, 2, 4) сейчас валит весь файл, хотя интервалы читаются
     expected = set(range(1, n_seizures + 1))
     found = set(start_map) | set(end_map)
     if set(start_map) != expected or set(end_map) != expected:

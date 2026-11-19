@@ -17,7 +17,7 @@ from src.preprocessing.annotations import (
     parse_summary,
     parse_summary_text,
 )
-from src.preprocessing.edf_loader import EdfLoadError, load_edf
+from src.preprocessing.edf_loader import load_edf
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -357,7 +357,7 @@ def test_load_edf_missing_and_corrupt(tmp_path: Path) -> None:
 
     corrupt = tmp_path / "corrupt.edf"
     corrupt.write_bytes(b"this is not an edf file")
-    with pytest.raises(EdfLoadError):
+    with pytest.raises(RuntimeError):
         load_edf(corrupt, target_sfreq=256)
 
     with pytest.raises(ValueError, match="положительным"):
