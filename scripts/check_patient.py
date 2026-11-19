@@ -7,6 +7,10 @@
 Запуск из корня репозитория:
 
     python scripts/check_patient.py --patient chb01 --data-root data/raw
+
+Полный конвейер (каналы, фильтр, окна, нормализация):
+
+    python scripts/run_preprocessing.py --patient chb01 --data-root data/raw
 """
 
 from __future__ import annotations

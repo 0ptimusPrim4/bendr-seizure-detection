@@ -236,6 +236,7 @@ def test_default_config_locks_task_values() -> None:
     assert len(mapping) == 20
     assert bendr_order[-1] == "SCALE"
     assert config["data"]["channels"]["drop"] == ["FT9-FT10", "FT10-T8"]
+    assert config["data"]["channels"]["on_missing"] == "error"
     assert list(mapping.values()).count("T8-P8") == 1
     assert "FT9-FT10" not in mapping.values()
     assert config["data"]["channels"]["chb01_reference"].count("T8-P8") == 2

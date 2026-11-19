@@ -1,5 +1,10 @@
-"""Тонкая настройка (fine-tuning) и перекрёстная проверка по пациентам.
+"""Тонкая настройка (fine-tuning) и перекрёстная проверка по пациентам."""
 
-Реализация — фаза 3. Разбиение LOPO-CV описывается отдельным модулем
-и по плану фазы 1 ещё не заполнено.
-"""
+from src.training.lopo_cv import LopoSplit, LopoSplitError, WindowSubset, generate_lopo_splits
+
+__all__ = [
+    "LopoSplit",
+    "LopoSplitError",
+    "WindowSubset",
+    "generate_lopo_splits",
+]
