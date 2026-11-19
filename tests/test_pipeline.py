@@ -268,7 +268,7 @@ def _write_edf(path: Path, signals: np.ndarray, labels: list[str], sfreq: int) -
         writer.close()
 
 
-def test_run_preprocessing_script_reports_shapes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_preprocess_patient_reports_shapes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """Сквозной прогон: EDF chb01 превращается в окна [N, 20, 1024]."""
     sfreq = 256
     duration = 8
@@ -292,14 +292,14 @@ def test_run_preprocessing_script_reports_shapes(tmp_path: Path, capsys: pytest.
     (patient_dir / "chb01-summary.txt").write_text(summary, encoding="utf-8")
 
     spec = importlib.util.spec_from_file_location(
-        "run_preprocessing",
-        ROOT / "scripts" / "run_preprocessing.py",
+        "preprocess_patient",
+        ROOT / "scripts" / "preprocess_patient.py",
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     exit_code = module.main(
-        ["--patient", "chb01", "--data-root", str(tmp_path), "--config", str(ROOT / "configs" / "default.yaml")]
+        ["--all", "--patient", "chb01", "--data-root", str(tmp_path), "--config", str(ROOT / "configs" / "default.yaml")]
     )
     captured = capsys.readouterr()
 
@@ -307,3 +307,20 @@ def test_run_preprocessing_script_reports_shapes(tmp_path: Path, capsys: pytest.
     assert "Окна [N, C, T]: [2, 20, 1024]" in captured.out
     assert "Класс 0 (фон): 2" in captured.out
     assert "Класс 1 (приступ): 0" in captured.out
+
+    one_file = module.main(
+        [
+            "--patient",
+            "chb01",
+            "--edf",
+            str(patient_dir / "chb01_01.edf"),
+            "--data-root",
+            str(tmp_path),
+            "--config",
+            str(ROOT / "configs" / "default.yaml"),
+        ]
+    )
+    one_captured = capsys.readouterr()
+    assert one_file == 0
+    assert "Окна [N, C, T]: [2, 20, 1024]" in one_captured.out
+    assert "Файлов прочитано: 1" in one_captured.out

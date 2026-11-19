@@ -10,7 +10,7 @@ def main() -> None:
     """Сообщить, что шаг конвейера ещё не реализован."""
     print(
         "Этот шаг ещё не реализован. Сейчас доступна проверка одного пациента:\n"
-        "  python scripts/check_patient.py --patient chb01 --data-root data/raw"
+        "  python scripts/preprocess_patient.py --quick --patient chb01 --data-root data/raw"
     )
 
 

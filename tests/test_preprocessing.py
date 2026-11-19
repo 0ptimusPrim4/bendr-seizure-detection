@@ -364,20 +364,23 @@ def test_load_edf_missing_and_corrupt(tmp_path: Path) -> None:
         load_edf(corrupt, target_sfreq=0)
 
 
-def test_check_patient_script_reports_summary_without_edf(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """Сквозной запуск проверки chb01, когда на диске есть только сводка."""
+def test_quick_mode_reports_summary_without_edf(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Режим --quick читает сводку chb01, когда на диске нет EDF."""
     import importlib.util
 
     patient_dir = tmp_path / "chb01"
     patient_dir.mkdir()
     (patient_dir / "chb01-summary.txt").write_text(CHB01_EXCERPT, encoding="utf-8")
 
-    spec = importlib.util.spec_from_file_location("check_patient", ROOT / "scripts" / "check_patient.py")
+    spec = importlib.util.spec_from_file_location(
+        "preprocess_patient",
+        ROOT / "scripts" / "preprocess_patient.py",
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    exit_code = module.main(["--patient", "chb01", "--data-root", str(tmp_path)])
+    exit_code = module.main(["--quick", "--patient", "chb01", "--data-root", str(tmp_path)])
     captured = capsys.readouterr()
 
     assert exit_code == 0

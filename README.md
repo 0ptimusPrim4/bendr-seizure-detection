@@ -53,15 +53,28 @@ data/raw/chb01/chb01_03.edf
 
 Предобученные веса энкодера и контекстуализатора публикует репозиторий
 [SPOClab-ca/BENDR, релиз v0.1-alpha](https://github.com/SPOClab-ca/BENDR/releases/tag/v0.1-alpha).
-Их нужно положить в `weights/`. Загрузчик весов с проверкой ключей `state_dict`
-появится на фазе 2.
+Их нужно положить в `weights/`. `BENDRClassifier.load_pretrained` подставляет
+совпавшие тензоры энкодера и оставляет голову случайной.
+
+## Структура
+
+```text
+configs/default.yaml              гиперпараметры
+scripts/preprocess_patient.py     проверка сводки и полный конвейер одного пациента
+src/preprocessing/                сводки, EDF, каналы, фильтр, окна, нормализация
+src/models/bendr.py               BENDRClassifier: энкодер и голова
+src/training/lopo_cv.py           разбиение «один пациент вне выборки»
+src/training/trainer.py           ранняя остановка
+```
 
 ## Проверка одного пациента
 
-Из корня репозитория:
+Из корня репозитория. Режим задаётся явно: `--quick`, `--edf` или `--all`.
+
+Быстрое чтение сводки и, если файл есть, одного EDF:
 
 ```bash
-python scripts/check_patient.py --patient chb01 --data-root data/raw
+python scripts/preprocess_patient.py --quick --patient chb01 --data-root data/raw
 ```
 
 Скрипт печатает число файлов и приступов из `chb01-summary.txt`. Если в каталоге
@@ -69,23 +82,29 @@ python scripts/check_patient.py --patient chb01 --data-root data/raw
 форму тензора `[C, T]` и имена каналов. Без EDF сводка всё равно проверяется,
 а в конце будет сказано, какой файл положить рядом.
 
-Проверить конкретную запись:
+Проверить конкретную запись, не запуская фильтр и окна:
 
 ```bash
-python scripts/check_patient.py --patient chb01 --edf data/raw/chb01/chb01_03.edf --require-edf
+python scripts/preprocess_patient.py --quick --patient chb01 --edf data/raw/chb01/chb01_03.edf --require-edf
 ```
 
-Коды возврата: `0` — сводка прочитана, `1` — ошибка разбора или чтения,
+Коды возврата: `0` — запрошенное чтение удалось, `1` — ошибка режима, разбора или чтения,
 `2` — сводка не найдена.
 
-Полный конвейер одного пациента (каналы, фильтр 0.5–50 Гц, окна 4 с, метки,
+Полный конвейер одного файла (каналы, фильтр 0.5–50 Гц, окна 4 с, метки,
 нормализация) печатает форму `[N, 20, 1024]` и число окон классов 0 и 1:
 
 ```bash
-python scripts/run_preprocessing.py --patient chb01 --data-root data/raw
+python scripts/preprocess_patient.py --patient chb01 --edf data/raw/chb01/chb01_03.edf --data-root data/raw
 ```
 
-Тесты парсера, конвейера и разбиения LOPO-CV:
+Тот же конвейер для всех EDF пациента, которые уже лежат на диске:
+
+```bash
+python scripts/preprocess_patient.py --all --patient chb01 --data-root data/raw
+```
+
+Тесты парсера, конвейера, классификатора и разбиения LOPO-CV:
 
 ```bash
 pytest
@@ -96,6 +115,7 @@ pytest
 Фаза 1 закрыта: каркас репозитория, конфиг, разбор сводок, чтение EDF,
 сопоставление 20 каналов, полосовой фильтр, окна с метками, нормализация
 по обучающей выборке и разбиение «один пациент вне выборки»
-(leave-one-patient-out, LOPO-CV). Модель, цикл обучения, постобработка
-и ноутбук анализа впереди: соответствующие модули пока содержат только
-описание назначения.
+(leave-one-patient-out, LOPO-CV). `BENDRClassifier` уже принимает окно
+`[B, 20, 1024]` и возвращает вероятности двух классов; ранняя остановка
+живёт в `src/training/trainer.py`. Цикл обучения, постобработка и ноутбук
+анализа впереди.

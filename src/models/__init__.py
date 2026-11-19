@@ -1,5 +1,9 @@
-"""Архитектура BENDR и классификатор приступа.
+"""Архитектура BENDR и классификатор приступа."""
 
-Свёрточный фронт-энд (convolutional front-end), трансформер-энкодер
-и голова классификации. Реализация — фаза 2.
-"""
+from src.models.bendr import BENDRClassifier, BENDREncoder, ClassificationHead
+
+__all__ = [
+    "BENDRClassifier",
+    "BENDREncoder",
+    "ClassificationHead",
+]
