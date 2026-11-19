@@ -7,10 +7,6 @@ TUEG (Temple University Hospital EEG Corpus). Здесь модель не об�
 загружаются готовые веса, затем выполняется тонкая настройка (fine-tuning)
 на базе CHB-MIT.
 
-Статья: Kostas D., Aroca-Ouellette S., Rudzicz F. «BENDR: Using Transformers and a
-Contrastive Self-Supervised Learning Task to Learn From Massive Amounts of EEG Data»,
-Frontiers in Human Neuroscience, 2021. DOI: [10.3389/fnhum.2021.653659](https://doi.org/10.3389/fnhum.2021.653659).
-
 ## Конвейер
 
 Сырые EDF-файлы → предварительная обработка (preprocessing) → предобученный
