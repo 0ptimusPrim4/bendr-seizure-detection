@@ -106,12 +106,25 @@ python scripts/preprocess_patient.py --all --patient chb01 --data-root data/raw
 pytest
 ```
 
+## Быстрый тест
+
+Две эпохи на одном пациенте: EDF, каналы, фильтр, окна, нормализация по train,
+случайная голова и шаг Adam. Если `weights/encoder.pt` нет, скрипт пишет
+«Веса не найдены, инициализация случайная» и всё равно учится. Без GPU берётся
+`batch_size_cpu` из конфига.
+
+```bash
+python scripts/train_single_patient.py --patient chb01
+```
+
+В конце каждой эпохи строка вида `Epoch 1 | Train Loss ... | Val Loss ... | Sensitivity ... | Specificity ...`.
+Чекпоинт появляется в `checkpoints/test_chb01.pt`. Это не полный LOPO-CV:
+тот вход ещё в `scripts/run_lopo_cv.py`.
+
 ## Статус
 
 Фаза 1 закрыта: каркас репозитория, конфиг, разбор сводок, чтение EDF,
 сопоставление 20 каналов, полосовой фильтр, окна с метками, нормализация
 по обучающей выборке и разбиение «один пациент вне выборки»
-(leave-one-patient-out, LOPO-CV). `BENDRClassifier` уже принимает окно
-`[B, 20, 1024]` и возвращает вероятности двух классов; ранняя остановка
-живёт в `src/training/trainer.py`. Цикл обучения, постобработка и ноутбук
-анализа впереди.
+(leave-one-patient-out, LOPO-CV). Модель, лосс и короткий прогон на одном
+пациенте есть. Постобработка и полный LOPO-CV впереди.
