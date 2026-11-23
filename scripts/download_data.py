@@ -1,20 +1,21 @@
-"""Загрузка базы CHB-MIT с PhysioNet.
+# -*- coding: utf-8 -*-
+"""Совместимая обёртка над scripts/download_chbmit.py.
 
-Скрипт будет реализован на следующем шаге фазы 1. Пока файлы кладутся
-в ``data/raw/chbXX/`` вручную, проверка запускается через
-``scripts/preprocess_patient.py --quick``.
+Раньше планировалось класть записи в data/raw/. Актуальный каталог
+по умолчанию — data/chbmit/ (см. README).
 """
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 
-def main() -> None:
-    """Сообщить, что шаг конвейера ещё не реализован."""
-    print(
-        "Этот шаг ещё не реализован. Сейчас доступна проверка одного пациента:\n"
-        "  python scripts/preprocess_patient.py --quick --patient chb01 --data-root data/raw"
-    )
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from download_chbmit import main
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

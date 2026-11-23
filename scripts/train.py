@@ -1,18 +1,17 @@
-"""Запуск тонкой настройки одного фолда LOPO-CV.
+# -*- coding: utf-8 -*-
+"""Обёртка: python scripts/train.py — то же, что python -m bendr_seizure train."""
 
-Скрипт будет реализован на фазе 3.
-"""
+import sys
+from pathlib import Path
 
-from __future__ import annotations
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-
-def main() -> None:
-    """Сообщить, что шаг конвейера ещё не реализован."""
-    print(
-        "Этот шаг ещё не реализован. Сейчас доступна проверка одного пациента:\n"
-        "  python scripts/preprocess_patient.py --quick --patient chb01 --data-root data/raw"
-    )
-
+from bendr_seizure.cli import main
 
 if __name__ == "__main__":
-    main()
+    argv = sys.argv[1:]
+    if not argv or argv[0].startswith("-"):
+        argv = ["train", *argv]
+    sys.exit(main(argv))
