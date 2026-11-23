@@ -23,6 +23,7 @@ data/annotations/*
 !data/annotations/.gitkeep
 data/chbmit/**
 !data/chbmit/.gitkeep
+data/cache/
 
 weights/**
 !weights/.gitkeep
