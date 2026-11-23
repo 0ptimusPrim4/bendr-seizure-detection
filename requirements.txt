@@ -1,33 +1,13 @@
-# Зависимости, реально используемые пакетом bendr_seizure.
-# Версии зафиксированы по pip freeze исходного окружения НИР-3
-# (Python 3.13.5, 23.11.2026). Транзитивные пакеты (jinja2, pillow и т.п.)
-# не перечислены: их подтянет установщик.
+# Зависимости prepare_data.py, train.py, evaluate.py.
+# Версии — из окружения НИР-3 (Python 3.13); подойдут и более ранние совместимые.
 #
-# PyTorch в исходном окружении стоял как torch==2.15.0+cpu.
-# На машине с GPU НЕ ставьте эту строку из pip freeze.
-# Сначала поставьте сборку с CUDA по инструкции https://pytorch.org
-# под вашу версию CUDA, затем остальные пакеты из этого файла.
-#
-# Пример (уточните индекс на pytorch.org под свою CUDA, здесь — условно cu128):
+# PyTorch ставится ОТДЕЛЬНО, под вашу версию CUDA (команда с https://pytorch.org), например:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu128
-#
-# numpy>=2, pandas 3, sklearn 1.9, mne 1.13 требуют относительно свежий Python
-# (3.10–3.13). На Windows удобнее 3.11 или 3.12, если для 3.13 ещё нет
-# нужного колеса CUDA.
+# Проверка:  python -c "import torch; print(torch.cuda.is_available())"
 
 numpy==2.5.5
 scipy==1.18.1
 scikit-learn==1.9.1
 pandas==3.1.1
-matplotlib==3.11.2
 mne==1.13.2
 PyYAML==6.0.4
-tqdm==4.70.1
-tabulate==0.10.0
-
-# Необязательно. В исходном окружении pyedflib не собрался (не было Python.h);
-# чтение EDF идёт через mne. Если заголовки CPython есть, можно поставить:
-# pyedflib>=0.1.30
-
-# Для тестов исходного пакета src/ (pytest.ini, tests/).
-pytest>=7.4.0
