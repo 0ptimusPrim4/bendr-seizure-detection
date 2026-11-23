@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
-"""
+# ====================== ПУТИ (при необходимости поменяйте здесь) ======================
+# Папка со скриптом и весами BENDR v0.1-alpha (encoder.pt, contextualizer.pt); сюда же results\
+SCRIPTS_DIR = r"C:\Users\abuzo\Desktop\МАГИСТРАТУРА\МАГИСТЕРСКАЯ\3 семестр\scripts"
+# Папка CHB-MIT: внутри chb01, chb02, ... с *.edf и chbXX-summary.txt
+DATA_DIR = r"C:\Users\abuzo\Desktop\МАГИСТРАТУРА\МАГИСТЕРСКАЯ\3 семестр\data\chb-mit-scalp-eeg-database-1.0.0"
+# =====================================================================================
+r"""
 Дообучение BENDR на CHB-MIT + оценка и пост-обработка, одним скриптом:
 
   python train_eval.py
 
 Данные и веса кладутся вручную (скрипт ничего не скачивает):
-  data/chbmit/chb01/*.edf + chb01-summary.txt, ..., chb24/...
-  weights/encoder.pt, weights/contextualizer.pt  (BENDR v0.1-alpha)
+  DATA_DIR\chb01\*.edf + chb01-summary.txt, ..., chb24\...
+  SCRIPTS_DIR\encoder.pt, SCRIPTS_DIR\contextualizer.pt  (BENDR v0.1-alpha)
+Если этих папок нет (другой ПК), веса и results ищутся рядом со скриптом, данные — в data/chbmit.
 EDF читаются сами: 20 каналов 10-20, 256 Гц, Баттерворт 0,5–50 Гц (sosfiltfilt, порядок 5),
 окна 4 с / 1024 отсчёта, 15 мин постиктала исключаются; окна кэшируются в --cache-dir.
 Режимы --freeze: full — учится всё (диссертация); encoder — заморожен свёрточный энкодер;
@@ -14,8 +21,6 @@ partial — последние --unfreeze-last слоёв трансформер
 Доли 25/50/100 % (--fractions) — объём обучающей выборки.
 Метрики до/после пост-обработки (голосование в нечётном окне, группировка FP) — <out>/<run>/summary.csv.
 """
-
-from __future__ import annotations
 
 import argparse
 import hashlib
@@ -28,7 +33,12 @@ import warnings
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
+import os
+
 ROOT = Path(__file__).resolve().parent
+# Фоллбек, если Windows-пути из начала файла на этом ПК не существуют
+_SCRIPTS = Path(SCRIPTS_DIR) if Path(SCRIPTS_DIR).is_dir() else ROOT
+_DATA = Path(DATA_DIR) if Path(DATA_DIR).is_dir() else ROOT / "data" / "chbmit"
 
 # Параметры предобработки (диссертация Benfenati / исходный configs/default.yaml)
 SFREQ = 256.0
@@ -140,7 +150,7 @@ def prepare_patient(patient, raw_dir, cache_dir, on_missing="skip"):
     """Строит кэш пациента; повторный запуск ничего не пересчитывает."""
     out = Path(cache_dir) / patient
     meta_path = out / "meta.json"
-    if meta_path.is_file() and json.loads(meta_path.read_text())["signature"] == SIGNATURE:
+    if meta_path.is_file() and json.loads(meta_path.read_text(encoding="utf-8"))["signature"] == SIGNATURE:
         return f"{patient}: кэш готов"
     raw_dir = Path(raw_dir)
     summary = raw_dir / patient / f"{patient}-summary.txt"
@@ -168,7 +178,7 @@ def prepare_patient(patient, raw_dir, cache_dir, on_missing="skip"):
                       "ch_sumsq": (w64 ** 2).sum((0, 2)).tolist(), "ch_count": int(w.shape[0] * w.shape[2])})
     meta = {"patient": patient, "signature": SIGNATURE, "files": files, "skipped_files": skipped,
             "n_windows": sum(f["n_windows"] for f in files), "n_seizure": sum(f["n_seizure"] for f in files)}
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1))
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
     return (f"{patient}: {len(files)} файлов, {meta['n_windows']} окон (приступ {meta['n_seizure']}), "
             f"пропущено {len(skipped)} файлов с неполным монтажом, {time.time() - t0:.0f} с")
 
@@ -178,7 +188,7 @@ class PatientCache:
 
     def __init__(self, cache_dir, patient):
         self.dir = Path(cache_dir) / patient
-        self.meta = json.loads((self.dir / "meta.json").read_text())
+        self.meta = json.loads((self.dir / "meta.json").read_text(encoding="utf-8"))
         self.files = self.meta["files"]
         self._mm = {}
         self.labels = np.concatenate([np.load(self.dir / f"{f['stem']}_labels.npy") for f in self.files]).astype(np.int64)
@@ -545,7 +555,7 @@ def train_fold(fold, frac, caches, a, device, run_dir, log):
     events = {int(i): tc.files[i]["seizures"] for i in np.unique(tc.file_idx[ti])}
     info = {"fold": fold["name"], "fraction": frac, "freeze": a.freeze, "threshold": thr,
             "val_auc": auc(yva, pva), "events": events, "history": hist}
-    (out / "fold.json").write_text(json.dumps(info, ensure_ascii=False, indent=1))
+    (out / "fold.json").write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
     log(f"{tag}: порог {thr:.3f}, val AUC {info['val_auc']}, test AUC {auc(yte, pte)}")
 
 
@@ -592,7 +602,7 @@ def metrics(y, p, fid, st, events, thr, w):
 def evaluate(run_dir, widths, thr_override=None):
     rows = []
     for d in sorted(x for x in run_dir.iterdir() if (x / "preds.npz").is_file()):
-        info = json.loads((d / "fold.json").read_text())
+        info = json.loads((d / "fold.json").read_text(encoding="utf-8"))
         z = np.load(d / "preds.npz")
         ev = {int(k): v for k, v in info["events"].items()}
         thr = info["threshold"] if thr_override is None else thr_override
@@ -608,7 +618,7 @@ def evaluate(run_dir, widths, thr_override=None):
     s.insert(3, "n_folds", df.groupby(["fraction", "vote_width"]).size().values)
     s.to_csv(run_dir / "summary.csv", index=False)
     (run_dir / "metrics.json").write_text(json.dumps({"per_fold": rows, "summary": s.to_dict("records")},
-                                                     ensure_ascii=False, indent=1, default=float))
+                                                     ensure_ascii=False, indent=1, default=float), encoding="utf-8")
     print(s.to_string(index=False))
     print(f"\nРезультаты: {run_dir}")
 
@@ -621,7 +631,7 @@ def check_inputs(a):
     data = Path(a.data_dir)
     if not data.is_dir():
         errors.append(f"Нет папки с CHB-MIT: {data}\n  Положите туда папки chb01 … chb24 с файлами *.edf и chbXX-summary.txt "
-                      f"(https://physionet.org/content/chbmit/1.0.0/) или укажите --data-dir.")
+                      f"(https://physionet.org/content/chbmit/1.0.0/) или поправьте DATA_DIR в начале train_eval.py / флаг --data-dir.")
     else:
         found = sorted(p.name for p in data.glob("chb*") if (p / f"{p.name}-summary.txt").is_file() and any(p.glob("*.edf")))
         a.patients = a.patients or found
@@ -634,7 +644,7 @@ def check_inputs(a):
     for flag, path in (("--encoder", a.encoder), ("--contextualizer", a.contextualizer)):
         if not Path(path).is_file():
             errors.append(f"Нет весов BENDR: {path}\n  Положите файл {Path(path).name} (релиз v0.1-alpha, "
-                          f"https://github.com/SPOClab-ca/BENDR/releases/tag/v0.1-alpha) по этому пути или укажите {flag}.")
+                          f"https://github.com/SPOClab-ca/BENDR/releases/tag/v0.1-alpha) по этому пути (папка SCRIPTS_DIR в начале train_eval.py) или укажите {flag}.")
     if errors:
         sys.exit("ОШИБКА:\n" + "\n".join(errors))
 
@@ -643,7 +653,7 @@ def build_cache(a):
     """Читает EDF и кэширует окна (один раз; при повторном запуске берётся готовый кэш)."""
     Path(a.cache_dir).mkdir(parents=True, exist_ok=True)
     todo = [p for p in a.patients if not (Path(a.cache_dir) / p / "meta.json").is_file()
-            or json.loads((Path(a.cache_dir) / p / "meta.json").read_text())["signature"] != SIGNATURE]
+            or json.loads((Path(a.cache_dir) / p / "meta.json").read_text(encoding="utf-8"))["signature"] != SIGNATURE]
     if not todo:
         return
     print(f"Предобработка EDF: {', '.join(todo)} → {a.cache_dir}")
@@ -658,16 +668,16 @@ def build_cache(a):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Дообучение BENDR на CHB-MIT + оценка (значения по умолчанию — из диссертации).")
-    ap.add_argument("--data-dir", default="data/chbmit", help="папки chb01…chb24 с *.edf и *-summary.txt")
-    ap.add_argument("--encoder", default="weights/encoder.pt")
-    ap.add_argument("--contextualizer", default="weights/contextualizer.pt")
-    ap.add_argument("--out", default="results", help="куда писать результаты")
+    ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, description="Дообучение BENDR на CHB-MIT + оценка (значения по умолчанию — из диссертации).")
+    ap.add_argument("--data-dir", default=str(_DATA), help="папка с chb01…chb24 (*.edf и *-summary.txt)")
+    ap.add_argument("--encoder", default=str(_SCRIPTS / "encoder.pt"))
+    ap.add_argument("--contextualizer", default=str(_SCRIPTS / "contextualizer.pt"))
+    ap.add_argument("--out", default=str(_SCRIPTS / "results"), help="результаты; кэш окон — <out>/cache")
     ap.add_argument("--cache-dir", default=None, help="кэш окон, по умолчанию <out>/cache")
     ap.add_argument("--patients", nargs="+", default=None, help="по умолчанию все chbXX в --data-dir")
     ap.add_argument("--on-missing", choices=["skip", "zero"], default="skip",
                     help="EDF с неполным монтажом: пропустить или заполнить каналы нулями")
-    ap.add_argument("--prep-workers", type=int, default=2, help="процессов чтения EDF")
+    ap.add_argument("--prep-workers", type=int, default=1 if os.name == "nt" else 2, help="процессов чтения EDF")
     ap.add_argument("--run-name", default=None, help="по умолчанию <схема>_<freeze>")
     ap.add_argument("--scheme", choices=["lopo", "patient_wise"], default="lopo")
     ap.add_argument("--test-patients", nargs="+", help="какие фолды считать (по умолчанию все)")
@@ -690,7 +700,8 @@ def main():
     ap.add_argument("--vote-widths", nargs="+", type=int, default=[1, 3, 5, 7], help="1 = без пост-обработки")
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     ap.add_argument("--no-amp", action="store_true")
-    ap.add_argument("--workers", type=int, default=4, help="процессов DataLoader")
+    # на Windows процессы DataLoader запускаются через spawn и часто мешают — по умолчанию 0
+    ap.add_argument("--workers", type=int, default=0 if os.name == "nt" else 4, help="процессов DataLoader")
     ap.add_argument("--threads", type=int, default=None, help="потоков torch на CPU")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--force", action="store_true", help="пересчитать готовые фолды")
@@ -724,7 +735,7 @@ def main():
         logf.write(msg + "\n")
         logf.flush()
 
-    (run_dir / "args.json").write_text(json.dumps(vars(a), ensure_ascii=False, indent=1))
+    (run_dir / "args.json").write_text(json.dumps(vars(a), ensure_ascii=False, indent=1), encoding="utf-8")
     log(f"=== {time.strftime('%Y-%m-%d %H:%M')} | {device} "
         f"{torch.cuda.get_device_name(0) if device.type == 'cuda' else ''} | пациентов {len(caches)} | {run_dir}")
     for fold in make_folds(a, caches, np.random.default_rng(a.seed)):
