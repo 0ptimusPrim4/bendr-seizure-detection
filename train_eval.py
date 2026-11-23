@@ -1,29 +1,61 @@
 # -*- coding: utf-8 -*-
 """
-Дообучение BENDR на CHB-MIT и оценка с пост-обработкой — одной командой:
+Дообучение BENDR на CHB-MIT + оценка и пост-обработка, одним скриптом:
 
-  python train_eval.py                 # подготовит данные при необходимости, LOPO по chb01–chb23
+  python train_eval.py
 
-Если кэша нет, вызывается prepare_data.py (скачивание CHB-MIT и весов, предобработка).
+Данные и веса кладутся вручную (скрипт ничего не скачивает):
+  data/chbmit/chb01/*.edf + chb01-summary.txt, ..., chb24/...
+  weights/encoder.pt, weights/contextualizer.pt  (BENDR v0.1-alpha)
+EDF читаются сами: 20 каналов 10-20, 256 Гц, Баттерворт 0,5–50 Гц (sosfiltfilt, порядок 5),
+окна 4 с / 1024 отсчёта, 15 мин постиктала исключаются; окна кэшируются в --cache-dir.
 Режимы --freeze: full — учится всё (диссертация); encoder — заморожен свёрточный энкодер;
-partial — учатся последние --unfreeze-last слоёв трансформера и голова; backbone — только голова.
-Доли 25/50/100 % (--fractions) — объём обучающей выборки; веса BENDR есть только для полной сети.
-Метрики до и после пост-обработки (голосование в нечётном окне, группировка FP) —
-results/<run>/summary.csv, metrics_all.csv, metrics.json.
+partial — последние --unfreeze-last слоёв трансформера и голова; backbone — только голова.
+Доли 25/50/100 % (--fractions) — объём обучающей выборки.
+Метрики до/после пост-обработки (голосование в нечётном окне, группировка FP) — <out>/<run>/summary.csv.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.util
 import json
+import re
 import sys
 import time
 import warnings
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-import prepare_data as P
+ROOT = Path(__file__).resolve().parent
 
-P.require("torch", "sklearn", "pandas")
+# Параметры предобработки (диссертация Benfenati / исходный configs/default.yaml)
+SFREQ = 256.0
+WINDOW_SEC = 4.0
+POSTICTAL_MIN = 15.0
+FILTER = (5, 0.5, 50.0)            # порядок, нижняя и верхняя частоты
+DROP = ["FT9-FT10", "FT10-T8", "T7-FT9"]
+# Слоты BENDR (19 электродов 10-20 + SCALE) ← биполярные отведения CHB-MIT в порядке сводки chb01.
+# Это порядок слотов, а не геометрия: таблицы пар в диссертации нет.
+MAPPING = {
+    "FP1": "FP1-F7", "FP2": "F7-T7", "F7": "T7-P7", "F3": "P7-O1", "FZ": "FP1-F3",
+    "F4": "F3-C3", "F8": "C3-P3", "T7": "P3-O1", "C3": "FP2-F4", "CZ": "F4-C4",
+    "C4": "C4-P4", "T8": "P4-O2", "T5": "FP2-F8", "P3": "F8-T8", "PZ": "T8-P8",
+    "P4": "P8-O2", "T6": "FZ-CZ", "O1": "CZ-PZ", "O2": "P7-T7",
+}
+SIGNATURE = hashlib.sha1(json.dumps([SFREQ, WINDOW_SEC, POSTICTAL_MIN, FILTER, DROP, MAPPING]).encode()).hexdigest()[:12]
+
+
+def require(*modules):
+    """Понятная ошибка, если не установлены зависимости."""
+    missing = [m for m in modules if importlib.util.find_spec(m) is None]
+    if missing:
+        sys.exit(f"Не установлены пакеты: {', '.join(missing)}.\n"
+                 f"Выполните: pip install -r requirements.txt (torch — с сайта pytorch.org под вашу CUDA).")
+
+
+require("numpy", "scipy", "mne", "torch", "sklearn", "pandas")
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import torch  # noqa: E402
@@ -32,6 +64,145 @@ from torch import nn  # noqa: E402
 from torch.utils.data import DataLoader, Dataset, TensorDataset, WeightedRandomSampler  # noqa: E402
 
 warnings.filterwarnings("ignore", message=".*weight_norm.*")
+
+
+# ------------------------------------------------------- чтение CHB-MIT
+
+def parse_summary(path):
+    """chbXX-summary.txt → список (имя файла, [(начало, конец), ...])."""
+    out, cur, start = [], None, None
+    for line in Path(path).read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        line = line.strip()
+        if m := re.match(r"^File Name:\s*(.+?)\s*$", line, re.I):
+            cur = (m.group(1), [])
+            out.append(cur)
+        elif cur and (m := re.match(r"^Seizure(?:\s+\d+)?\s+Start Time:\s*([\d.]+)", line, re.I)):
+            start = float(m.group(1))
+        elif cur and start is not None and (m := re.match(r"^Seizure(?:\s+\d+)?\s+End Time:\s*([\d.]+)", line, re.I)):
+            cur[1].append((start, float(m.group(1))))
+            start = None
+    return out
+
+
+def edf_labels(path):
+    # подписи из заголовка EDF: mne переименовывает дубликаты (T8-P8-0, T8-P8-1)
+    with open(path, "rb") as fh:
+        n = int(fh.read(256)[252:256].decode("ascii", "ignore").strip() or 0)
+        raw = fh.read(n * 16)
+    return [raw[i * 16:(i + 1) * 16].decode("ascii", "replace").strip().upper() for i in range(n)]
+
+
+def load_file(path, seizures, on_missing="skip"):
+    """Один EDF → окна [N, 20, 1024], метки, начала окон (с). None — файл пропущен."""
+    import mne
+    from scipy.signal import butter, sosfiltfilt
+    raw = mne.io.read_raw_edf(str(path), preload=True, verbose="ERROR")
+    if abs(raw.info["sfreq"] - SFREQ) > 1e-3:
+        raw.resample(SFREQ, verbose="ERROR")
+    data = raw.get_data().astype(np.float32)
+    names = edf_labels(path)
+    if len(names) != len(data):
+        names = [c.upper() for c in raw.ch_names]
+    idx = {}
+    for i, n in enumerate(names):
+        if n and n not in DROP and n not in idx:   # второй T8-P8 отбрасывается
+            idx[n] = i
+    absent = [src for src in MAPPING.values() if src not in idx]
+    if absent and on_missing != "zero":
+        return None, absent
+    eeg = np.stack([data[idx[s]] if s in idx else np.zeros(data.shape[1], np.float32) for s in MAPPING.values()])
+    scale = np.abs(eeg).mean(0, keepdims=True)  # SCALE — относительная амплитуда (выбрано автором)
+    x = np.concatenate([eeg, scale])
+    order, lo, hi = FILTER
+    sos = butter(order, [lo, hi], btype="bandpass", fs=SFREQ, output="sos")
+    x = sosfiltfilt(sos, x.astype(np.float64), axis=-1).astype(np.float32)
+
+    win, n = int(WINDOW_SEC * SFREQ), x.shape[1]
+    sz = [(int(a * SFREQ), min(n, int(np.ceil(b * SFREQ)))) for a, b in seizures]
+    post = [(b, min(n, b + int(POSTICTAL_MIN * 60 * SFREQ))) for _, b in sz]
+    hit = lambda s, e, rr: any(s < b and e > a for a, b in rr)
+    starts, labels = [], []
+    for s in range(0, n - win + 1, win):
+        if hit(s, s + win, sz):
+            labels.append(1)
+        elif hit(s, s + win, post):
+            continue
+        else:
+            labels.append(0)
+        starts.append(s)
+    if not starts:
+        return None, []
+    w = np.stack([x[:, s:s + win] for s in starts])
+    return (w, np.array(labels, np.int8), np.array(starts) / SFREQ), []
+
+
+def prepare_patient(patient, raw_dir, cache_dir, on_missing="skip"):
+    """Строит кэш пациента; повторный запуск ничего не пересчитывает."""
+    out = Path(cache_dir) / patient
+    meta_path = out / "meta.json"
+    if meta_path.is_file() and json.loads(meta_path.read_text())["signature"] == SIGNATURE:
+        return f"{patient}: кэш готов"
+    raw_dir = Path(raw_dir)
+    summary = raw_dir / patient / f"{patient}-summary.txt"
+    if not summary.is_file():
+        return f"{patient}: нет {summary}, пропуск"
+    out.mkdir(parents=True, exist_ok=True)
+    files, skipped, t0 = [], [], time.time()
+    for name, seizures in parse_summary(summary):
+        edf = raw_dir / patient / name
+        if not edf.is_file():
+            continue
+        res, absent = load_file(edf, seizures, on_missing)
+        if res is None:
+            if absent:
+                skipped.append({"file": name, "missing": absent})
+            continue
+        w, y, st = res
+        stem = edf.stem
+        np.save(out / f"{stem}_windows.npy", w)
+        np.save(out / f"{stem}_labels.npy", y)
+        np.save(out / f"{stem}_starts.npy", st)
+        w64 = w.astype(np.float64)
+        files.append({"file": name, "stem": stem, "n_windows": len(y), "n_seizure": int(y.sum()),
+                      "seizures": seizures, "ch_sum": w64.sum((0, 2)).tolist(),
+                      "ch_sumsq": (w64 ** 2).sum((0, 2)).tolist(), "ch_count": int(w.shape[0] * w.shape[2])})
+    meta = {"patient": patient, "signature": SIGNATURE, "files": files, "skipped_files": skipped,
+            "n_windows": sum(f["n_windows"] for f in files), "n_seizure": sum(f["n_seizure"] for f in files)}
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1))
+    return (f"{patient}: {len(files)} файлов, {meta['n_windows']} окон (приступ {meta['n_seizure']}), "
+            f"пропущено {len(skipped)} файлов с неполным монтажом, {time.time() - t0:.0f} с")
+
+
+class PatientCache:
+    """Окна пациента из кэша; сами окна читаются через memmap по требованию."""
+
+    def __init__(self, cache_dir, patient):
+        self.dir = Path(cache_dir) / patient
+        self.meta = json.loads((self.dir / "meta.json").read_text())
+        self.files = self.meta["files"]
+        self._mm = {}
+        self.labels = np.concatenate([np.load(self.dir / f"{f['stem']}_labels.npy") for f in self.files]).astype(np.int64)
+        self.starts = np.concatenate([np.load(self.dir / f"{f['stem']}_starts.npy") for f in self.files])
+        self.file_idx = np.concatenate([np.full(f["n_windows"], i) for i, f in enumerate(self.files)])
+        self.local = np.concatenate([np.arange(f["n_windows"]) for f in self.files])
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getstate__(self):  # в процессы DataLoader memmap не передаём
+        return {**self.__dict__, "_mm": {}}
+
+    def window(self, i):
+        f = int(self.file_idx[i])
+        if f not in self._mm:
+            self._mm[f] = np.load(self.dir / f"{self.files[f]['stem']}_windows.npy", mmap_mode="r")
+        return np.asarray(self._mm[f][self.local[i]], np.float32)
+
+    def channel_stats(self, file_ids=None):
+        ids = range(len(self.files)) if file_ids is None else file_ids
+        return (sum(np.array(self.files[i]["ch_sum"]) for i in ids),
+                sum(np.array(self.files[i]["ch_sumsq"]) for i in ids),
+                sum(self.files[i]["ch_count"] for i in ids))
 
 
 # ------------------------------------------------- модель BENDR (структура SPOClab-ca)
@@ -117,10 +288,9 @@ class BENDR(nn.Module):
     def forward(self, x):
         return self.head(self.features(x))
 
-    def load_pretrained(self, wdir):
-        for name, mod in (("encoder", self.encoder), ("contextualizer", self.contextualizer)):
-            miss, unexp = mod.load_state_dict(torch.load(Path(wdir) / f"{name}.pt", map_location="cpu",
-                                                         weights_only=True), strict=False)
+    def load_pretrained(self, enc_path, ctx_path):
+        for name, mod, path in (("encoder", self.encoder, enc_path), ("contextualizer", self.contextualizer, ctx_path)):
+            miss, unexp = mod.load_state_dict(torch.load(path, map_location="cpu", weights_only=True), strict=False)
             if miss or unexp:
                 print(f"ВНИМАНИЕ: {name}.pt загружен не полностью: {miss} {unexp}")
 
@@ -344,7 +514,7 @@ def train_fold(fold, frac, caches, a, device, run_dir, log):
     cw = (len(ytr) / (2 * np.maximum(np.bincount(ytr, minlength=2), 1))).tolist() if a.balancing == "class_weights" else None
     crit = SSWCE(weights=cw)
     model = BENDR(a.feature)
-    model.load_pretrained(a.weights_dir)
+    model.load_pretrained(a.encoder, a.contextualizer)
     n_tr = set_freeze(model, a.freeze, a.unfreeze_last)
     model.to(device)
     amp = device.type == "cuda" and not a.no_amp
@@ -405,16 +575,16 @@ def metrics(y, p, fid, st, events, thr, w):
         fp = (pf == 1) & (y[m] == 0)
         groups += int(fp[0]) + int((fp[1:] & ~fp[:-1]).sum())
         for a0, b0 in events.get(int(f), []):
-            ov = (st[m] < b0) & (st[m] + P.WINDOW_SEC > a0)
+            ov = (st[m] < b0) & (st[m] + WINDOW_SEC > a0)
             if ov.any():
                 total, hit = total + 1, hit + int(pf[ov].any())
     tp, tn = int(((out == 1) & (y == 1)).sum()), int(((out == 0) & (y == 0)).sum())
     fp, fn = int(((out == 1) & (y == 0)).sum()), int(((out == 0) & (y == 1)).sum())
     spec = tn / (tn + fp) if tn + fp else None
-    hours = (tn + fp) * P.WINDOW_SEC / 3600
+    hours = (tn + fp) * WINDOW_SEC / 3600
     return {"vote_width": w, "stage": "до" if w == 1 else "после", "tp": tp, "tn": tn, "fp": fp, "fn": fn,
             "sensitivity": tp / (tp + fn) if tp + fn else None, "specificity": spec,
-            "fp_per_hour": None if spec is None else (1 - spec) * 3600 / P.WINDOW_SEC,  # формула диссертации
+            "fp_per_hour": None if spec is None else (1 - spec) * 3600 / WINDOW_SEC,  # формула диссертации
             "grouped_fp_per_hour": groups / hours if hours else None,
             "event_sensitivity": hit / total if total else None, "n_events": total}
 
@@ -445,10 +615,59 @@ def evaluate(run_dir, widths, thr_override=None):
 
 # ------------------------------------------------------------------- запуск
 
+def check_inputs(a):
+    """Проверка путей до старта: понятная ошибка, куда положить файлы."""
+    errors = []
+    data = Path(a.data_dir)
+    if not data.is_dir():
+        errors.append(f"Нет папки с CHB-MIT: {data}\n  Положите туда папки chb01 … chb24 с файлами *.edf и chbXX-summary.txt "
+                      f"(https://physionet.org/content/chbmit/1.0.0/) или укажите --data-dir.")
+    else:
+        found = sorted(p.name for p in data.glob("chb*") if (p / f"{p.name}-summary.txt").is_file() and any(p.glob("*.edf")))
+        a.patients = a.patients or found
+        missing = [p for p in a.patients if p not in found]
+        if missing:
+            errors.append(f"В {data} нет данных пациентов: {', '.join(missing)}\n"
+                          f"  Ожидается {data}/chbXX/chbXX-summary.txt и {data}/chbXX/*.edf.")
+        elif len(a.patients) < 2 and a.scheme == "lopo":
+            errors.append(f"Для LOPO нужно минимум 2 пациента, найдено: {a.patients or 'ни одного'} в {data}.")
+    for flag, path in (("--encoder", a.encoder), ("--contextualizer", a.contextualizer)):
+        if not Path(path).is_file():
+            errors.append(f"Нет весов BENDR: {path}\n  Положите файл {Path(path).name} (релиз v0.1-alpha, "
+                          f"https://github.com/SPOClab-ca/BENDR/releases/tag/v0.1-alpha) по этому пути или укажите {flag}.")
+    if errors:
+        sys.exit("ОШИБКА:\n" + "\n".join(errors))
+
+
+def build_cache(a):
+    """Читает EDF и кэширует окна (один раз; при повторном запуске берётся готовый кэш)."""
+    Path(a.cache_dir).mkdir(parents=True, exist_ok=True)
+    todo = [p for p in a.patients if not (Path(a.cache_dir) / p / "meta.json").is_file()
+            or json.loads((Path(a.cache_dir) / p / "meta.json").read_text())["signature"] != SIGNATURE]
+    if not todo:
+        return
+    print(f"Предобработка EDF: {', '.join(todo)} → {a.cache_dir}")
+    if a.prep_workers > 1:
+        with ProcessPoolExecutor(a.prep_workers) as ex:
+            for msg in ex.map(prepare_patient, todo, [a.data_dir] * len(todo), [a.cache_dir] * len(todo),
+                              [a.on_missing] * len(todo)):
+                print(msg, flush=True)
+    else:
+        for p in todo:
+            print(prepare_patient(p, a.data_dir, a.cache_dir, a.on_missing), flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Дообучение BENDR на CHB-MIT + оценка (значения по умолчанию — из диссертации).")
-    P.add_path_args(ap)
-    ap.add_argument("--results-dir", default=str(P.ROOT / "results"))
+    ap.add_argument("--data-dir", default="data/chbmit", help="папки chb01…chb24 с *.edf и *-summary.txt")
+    ap.add_argument("--encoder", default="weights/encoder.pt")
+    ap.add_argument("--contextualizer", default="weights/contextualizer.pt")
+    ap.add_argument("--out", default="results", help="куда писать результаты")
+    ap.add_argument("--cache-dir", default=None, help="кэш окон, по умолчанию <out>/cache")
+    ap.add_argument("--patients", nargs="+", default=None, help="по умолчанию все chbXX в --data-dir")
+    ap.add_argument("--on-missing", choices=["skip", "zero"], default="skip",
+                    help="EDF с неполным монтажом: пропустить или заполнить каналы нулями")
+    ap.add_argument("--prep-workers", type=int, default=2, help="процессов чтения EDF")
     ap.add_argument("--run-name", default=None, help="по умолчанию <схема>_<freeze>")
     ap.add_argument("--scheme", choices=["lopo", "patient_wise"], default="lopo")
     ap.add_argument("--test-patients", nargs="+", help="какие фолды считать (по умолчанию все)")
@@ -480,7 +699,10 @@ def main():
     if any(w % 2 == 0 for w in a.vote_widths):
         sys.exit("Окна голосования должны быть нечётными.")
 
-    run_dir = Path(a.results_dir) / (a.run_name or f"{a.scheme}_{a.freeze}")
+    a.cache_dir = a.cache_dir or str(Path(a.out) / "cache")
+    if not a.eval_only:
+        check_inputs(a)
+    run_dir = Path(a.out) / (a.run_name or f"{a.scheme}_{a.freeze}")
     run_dir.mkdir(parents=True, exist_ok=True)
     if a.eval_only:
         return evaluate(run_dir, a.vote_widths)
@@ -493,8 +715,8 @@ def main():
     torch.manual_seed(a.seed)
     np.random.seed(a.seed)
 
-    P.prepare_all(a.patients, a.raw_dir, a.cache_dir, a.weights_dir, a.prep_workers, not a.no_download, a.on_missing)
-    caches = {p: P.PatientCache(a.cache_dir, p) for p in a.patients if (Path(a.cache_dir) / p / "meta.json").is_file()}
+    build_cache(a)
+    caches = {p: PatientCache(a.cache_dir, p) for p in a.patients if (Path(a.cache_dir) / p / "meta.json").is_file()}
     logf = (run_dir / "train.log").open("a", encoding="utf-8")
 
     def log(msg):
