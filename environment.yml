@@ -1,0 +1,14 @@
+# Conda-окружение для дообучения BENDR (НИР-3).
+# Версия Python совпадает с исходным venv: 3.13.
+# На Windows при отсутствии колёс CUDA для 3.13 замените python=3.13 на 3.12.
+name: bendr-seizure
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - pip
+  - pip:
+      - -r requirements.txt
+# PyTorch с CUDA в этот файл намеренно не включён: канал и версия CUDA
+# зависят от драйвера на вашем ПК. Поставьте torch отдельно, см. README.md
+# и https://pytorch.org/get-started/locally/

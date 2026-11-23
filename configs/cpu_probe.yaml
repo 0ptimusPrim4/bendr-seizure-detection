@@ -1,0 +1,172 @@
+# Переносимая копия scripts_final/config_probe.yaml.
+# Пути относительные. Добавлены ключи feature_variant, norm и threshold.mode
+# по итогам попытки 3 (см. README, раздел «Результаты на CPU»).
+# Конфигурация дообучения BENDR на CHB-MIT.
+# Значения, отмеченные как «диссертация / репозиторий», взяты из Benfenati (2023)
+# и из configs/default.yaml репозитория 0ptimusPrim4/bendr-seizure-detection.
+# Параметры с пометкой «автор» введены из-за ограничений CPU без GPU.
+
+seed: 42
+
+# Короткие ключи (удобно менять).
+# feature_variant: ctx_first | ctx_last | ctx_mean | enc_mean
+# norm: global (z-score по train, диссертация) | window (z-score внутри окна, выбор автора)
+feature_variant: ctx_mean    # выбрано по val AUC на CPU (попытка 3: window + ctx_mean)
+norm: window                 # выбрано автором (глобальный z-score давал val AUC хуже)
+
+device: auto
+
+paths:
+  raw_dir: data/chbmit
+  weights_dir: weights
+  results_dir: results
+  checkpoints_dir: results/checkpoints
+  experiment_dir: lopo_probe
+
+data:
+  dataset: chb-mit
+  source_url: https://physionet.org/content/chbmit/1.0.0/
+  sampling_rate_hz: 256
+  window_sec: 4
+  n_channels_out: 20
+  postictal_exclusion_min: 15
+  patients: [chb01, chb02, chb03]
+  # Автор: на CPU берём все окна приступа и ограниченный фон из каждого файла.
+  # Обучение: больше фона, чем в первом прогоне (там 8 окон/файл дали почти равные классы).
+  max_background_per_file: 40
+  max_background_files: 8
+  # Тест: все окна выбранных файлов, без усечения фона. Иначе FP/ч считается
+  # на искусственно «приступной» выборке и не отражает часы межприступного периода.
+  test_max_background_per_file: null
+  test_max_background_files: 3
+  # Относительная амплитуда (канал SCALE) считается, а не берётся из T7-FT9.
+  # Это закрывает TODO исходного репозитория и соответствует To1020 BENDR.
+  scale_channel: relative_amplitude
+  filter:
+    type: butterworth
+    order: 5
+    low_hz: 0.5
+    high_hz: 50.0
+  normalization:
+    method: z-score
+    fit_on: train
+    scope: window              # дублирует ключ norm
+  balancing:
+    method: weighted_random_sampling
+  channels:
+    drop:
+      - FT9-FT10
+      - FT10-T8
+      - T7-FT9
+    drop_later_duplicates: true
+    on_missing: error
+    bendr_order:
+      - FP1
+      - FP2
+      - F7
+      - F3
+      - FZ
+      - F4
+      - F8
+      - T7
+      - C3
+      - CZ
+      - C4
+      - T8
+      - T5
+      - P3
+      - PZ
+      - P4
+      - T6
+      - O1
+      - O2
+      - SCALE
+    mapping:
+      FP1: FP1-F7
+      FP2: F7-T7
+      F7: T7-P7
+      F3: P7-O1
+      FZ: FP1-F3
+      F4: F3-C3
+      F8: C3-P3
+      T7: P3-O1
+      C3: FP2-F4
+      CZ: F4-C4
+      C4: C4-P4
+      T8: P4-O2
+      T5: FP2-F8
+      P3: F8-T8
+      PZ: T8-P8
+      P4: P8-O2
+      T6: FZ-CZ
+      O1: CZ-PZ
+      O2: P7-T7
+
+model:
+  encoder_h: 512
+  # Ядра (3,2,2,2,2,2) в официальном коде делаются нечётными: (3,3,3,3,3,3).
+  # Шаги остаются (3,2,2,2,2,2), произведение 96. Иначе веса encoder.pt не сходятся.
+  enc_width: [3, 2, 2, 2, 2, 2]
+  enc_downsample: [3, 2, 2, 2, 2, 2]
+  d_model: 1536
+  ff_dim: 3076
+  n_layers: 8
+  n_heads: 8
+  relative_pos_kernel: 25
+  relative_pos_groups: 16
+  channel_dropout_p: 0.5
+  contextualizer_dropout: 0.15
+  n_classes: 2
+  use_first_token: true
+  masking: false
+
+loss:
+  name: sensitivity_specificity_weighted_cross_entropy
+  alpha: 0.3
+  beta: 0.5
+
+training:
+  optimizer: adam
+  # Автор: 1e-3 для линейного зонда (в диссертации 1e-4 задан для полного дообучения).
+  lr: 0.001
+  weight_decay: 0.01
+  scheduler: reduce_on_plateau
+  scheduler_mode: min
+  scheduler_factor: 0.1
+  scheduler_patience: 5
+  early_stopping_monitor: val_loss
+  early_stopping_patience: 8
+  early_stopping_min_delta: 0.0001
+  batch_size: 256
+  batch_size_cpu: 32
+  feature_batch_size: 8
+  # Автор: энкодер и контекстуализатор заморожены, признаки считаются один раз,
+  # поэтому доступно 25 эпох обучения только головы.
+  max_epochs: 25
+  freeze_encoder: true
+  freeze_contextualizer: true
+  mode: head_only
+  lopo:
+    val_fraction: 0.2
+    stratify: true
+  # Сначала 100 % обучающей выборки (главный прогон). 25 % и 50 % — если останется время.
+  data_fractions: [0.25, 0.5, 1.0]  # диссертация / репозиторий; попытка 3 считала все три доли
+
+features:
+  cache_dir: results/feature_cache
+
+postprocessing:
+  threshold:
+    mode: youden             # выбрано автором
+  smoothing:
+    enabled: true
+    method: majority_voting
+    window: 3
+  fp_grouping:
+    enabled: true
+  event_based_sensitivity:
+    enabled: true
+
+weights:
+  encoder_filename: encoder.pt
+  contextualizer_filename: contextualizer.pt
