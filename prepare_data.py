@@ -1,28 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Шаг 1. Подготовка данных: загрузка CHB-MIT и весов BENDR (по желанию), проверка,
-предобработка и кэш окон.
+Подготовка CHB-MIT для дообучения BENDR: скачивание записей и весов, предобработка, кэш окон.
 
-Что делает:
-  1) --download    скачивает индекс PhysioNet и записи выбранных пациентов в data/chbmit/;
-  2) --weights     скачивает encoder.pt и contextualizer.pt (BENDR v0.1-alpha) и сверяет SHA-256;
-  3) по умолчанию  для каждого пациента: summary → EDF → маппинг 20 каналов →
-                   ресемплинг 256 Гц → Баттерворт 0,5–50 Гц → окна 4 с / 1024 отсчёта →
-                   метки приступов → кэш data/cache/<пациент>/ (по .npy на файл + meta.json).
-Нормализация здесь не применяется: в кэш пишутся статистики каналов, а z-score
-делает train.py (по обучающим пациентам фолда, чтобы не было утечки из теста).
+  python prepare_data.py                      # пациенты chb01–chb23, всё по умолчанию
+  python prepare_data.py --patients chb01 chb02
 
-Примеры:
-  python prepare_data.py --config configs/gpu.yaml --download --weights
-  python prepare_data.py --config configs/gpu.yaml --patients chb01 chb02 --workers 4
-  python prepare_data.py --config configs/gpu.yaml --check
+Конвейер: summary → EDF → 20 каналов 10-20 → 256 Гц → Баттерворт 0,5–50 Гц (порядок 5)
+→ окна 4 с / 1024 отсчёта без перекрытия, 15 мин постиктала исключаются → data/cache/<пациент>/.
+z-score здесь не делается: в кэш пишутся суммы по каналам, нормализует train_eval.py
+по обучающим пациентам фолда.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
+import re
 import sys
 import time
 import urllib.error
@@ -30,24 +25,49 @@ import urllib.request
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-import numpy as np
-
-import common as C
-
+ROOT = Path(__file__).resolve().parent
 PHYSIONET = "https://physionet.org/files/chbmit/1.0.0/"
 RELEASE = "https://github.com/SPOClab-ca/BENDR/releases/download/v0.1-alpha"
-WEIGHTS = {  # размеры и SHA-256 копий, использованных в НИР-3
+WEIGHTS = {  # размер и SHA-256 файлов релиза v0.1-alpha
     "encoder.pt": (15_893_001, "32c913b1778d8bdf7f08bbe8ef5e6bef2954087b482851816deefc4d0fcf84cb"),
     "contextualizer.pt": (612_693_181, "b8ee0c8c8403809d65114ae88485cdf841dd1860a88ebebb4cdee2bf26f91526"),
 }
+ALL_PATIENTS = [f"chb{i:02d}" for i in range(1, 24)]  # 23 случая из SUBJECT-INFO
+
+# Параметры предобработки (диссертация Benfenati / исходный configs/default.yaml)
+SFREQ = 256.0
+WINDOW_SEC = 4.0
+POSTICTAL_MIN = 15.0
+FILTER = (5, 0.5, 50.0)            # порядок, нижняя и верхняя частоты
+DROP = ["FT9-FT10", "FT10-T8", "T7-FT9"]
+# Слоты BENDR (19 электродов 10-20 + SCALE) ← биполярные отведения CHB-MIT в порядке сводки chb01.
+# Это порядок слотов, а не геометрия: таблицы пар в диссертации нет.
+MAPPING = {
+    "FP1": "FP1-F7", "FP2": "F7-T7", "F7": "T7-P7", "F3": "P7-O1", "FZ": "FP1-F3",
+    "F4": "F3-C3", "F8": "C3-P3", "T7": "P3-O1", "C3": "FP2-F4", "CZ": "F4-C4",
+    "C4": "C4-P4", "T8": "P4-O2", "T5": "FP2-F8", "P3": "F8-T8", "PZ": "T8-P8",
+    "P4": "P8-O2", "T6": "FZ-CZ", "O1": "CZ-PZ", "O2": "P7-T7",
+}
+SIGNATURE = hashlib.sha1(json.dumps([SFREQ, WINDOW_SEC, POSTICTAL_MIN, FILTER, DROP, MAPPING]).encode()).hexdigest()[:12]
 
 
-# ---------------------------- загрузка ---------------------------------
+def require(*modules):
+    """Понятная ошибка, если не установлены зависимости."""
+    missing = [m for m in modules if importlib.util.find_spec(m) is None]
+    if missing:
+        sys.exit(f"Не установлены пакеты: {', '.join(missing)}.\n"
+                 f"Выполните: pip install -r requirements.txt (torch — с сайта pytorch.org под вашу CUDA).")
 
-def fetch(url, dest, force=False, missing_ok=False):
-    """Скачивание через временный .part, чтобы оборванный файл не считался готовым."""
+
+require("numpy", "scipy", "mne")
+import numpy as np  # noqa: E402
+
+
+# ------------------------------------------------------------------ загрузка
+
+def fetch(url, dest, missing_ok=False):
     dest = Path(dest)
-    if dest.is_file() and dest.stat().st_size > 0 and not force:
+    if dest.is_file() and dest.stat().st_size > 0:
         return True
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".part")
@@ -72,151 +92,205 @@ def fetch(url, dest, force=False, missing_ok=False):
     return True
 
 
-def download_chbmit(raw_dir, patients, force=False):
-    """Индекс PhysioNet + все записи выбранных пациентов (полный набор ~43 ГБ)."""
-    for name in ("RECORDS", "RECORDS-WITH-SEIZURES", "SUBJECT-INFO", "SHA256SUMS.txt"):
-        fetch(PHYSIONET + name, raw_dir / name, force)
-    records = [r.strip() for r in (raw_dir / "RECORDS").read_text().splitlines() if r.strip()]
-    for p in patients:
-        print(f"Пациент {p}")
-        fetch(f"{PHYSIONET}{p}/{p}-summary.txt", raw_dir / p / f"{p}-summary.txt", force)
-        for rel in (r for r in records if r.startswith(p + "/")):
-            fetch(PHYSIONET + rel, raw_dir / rel, force)
-            fetch(PHYSIONET + rel + ".seizures", raw_dir / (rel + ".seizures"), force, missing_ok=True)
-
-
-def sha256(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        while b := fh.read(1 << 20):
-            h.update(b)
-    return h.hexdigest()
-
-
-def download_weights(weights_dir, force=False):
-    ok = True
+def ensure_weights(weights_dir):
+    """Скачивает веса BENDR, если их нет, и сверяет размер."""
+    weights_dir = Path(weights_dir)
     for name, (size, digest) in WEIGHTS.items():
         dest = weights_dir / name
-        fetch(f"{RELEASE}/{name}", dest, force)
-        real = dest.stat().st_size
-        if real != size or sha256(dest) != digest:
-            print(f"  ОШИБКА: {name} не совпал по размеру/SHA-256 ({real} байт)", file=sys.stderr)
-            ok = False
+        if not dest.is_file():
+            print(f"Скачиваю веса BENDR {name} ...")
+            fetch(f"{RELEASE}/{name}", dest)
+            h = hashlib.sha256(dest.read_bytes()).hexdigest()
+            if h != digest:
+                sys.exit(f"SHA-256 {dest} не совпал — удалите файл и запустите снова.")
+        if dest.stat().st_size != size:
+            sys.exit(f"Размер {dest} не совпал ({dest.stat().st_size} вместо {size}) — удалите файл.")
+
+
+def ensure_raw(raw_dir, patient):
+    """Докачивает недостающие записи пациента с PhysioNet (около 1–3 ГБ на пациента)."""
+    raw_dir = Path(raw_dir)
+    fetch(PHYSIONET + "RECORDS", raw_dir / "RECORDS")
+    records = [r.strip() for r in (raw_dir / "RECORDS").read_text().splitlines() if r.strip().startswith(patient + "/")]
+    fetch(f"{PHYSIONET}{patient}/{patient}-summary.txt", raw_dir / patient / f"{patient}-summary.txt")
+    for rel in records:
+        if not (raw_dir / rel).is_file():
+            fetch(PHYSIONET + rel, raw_dir / rel)
+            fetch(PHYSIONET + rel + ".seizures", raw_dir / (rel + ".seizures"), missing_ok=True)
+
+
+# ------------------------------------------------------------ предобработка
+
+def parse_summary(path):
+    """chbXX-summary.txt → список (имя файла, [(начало, конец), ...])."""
+    out, cur, start = [], None, None
+    for line in Path(path).read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        line = line.strip()
+        if m := re.match(r"^File Name:\s*(.+?)\s*$", line, re.I):
+            cur = (m.group(1), [])
+            out.append(cur)
+        elif cur and (m := re.match(r"^Seizure(?:\s+\d+)?\s+Start Time:\s*([\d.]+)", line, re.I)):
+            start = float(m.group(1))
+        elif cur and start is not None and (m := re.match(r"^Seizure(?:\s+\d+)?\s+End Time:\s*([\d.]+)", line, re.I)):
+            cur[1].append((start, float(m.group(1))))
+            start = None
+    return out
+
+
+def edf_labels(path):
+    # подписи из заголовка EDF: mne переименовывает дубликаты (T8-P8-0, T8-P8-1)
+    with open(path, "rb") as fh:
+        n = int(fh.read(256)[252:256].decode("ascii", "ignore").strip() or 0)
+        raw = fh.read(n * 16)
+    return [raw[i * 16:(i + 1) * 16].decode("ascii", "replace").strip().upper() for i in range(n)]
+
+
+def load_file(path, seizures, on_missing="skip"):
+    """Один EDF → окна [N, 20, 1024], метки, начала окон (с). None — файл пропущен."""
+    import mne
+    from scipy.signal import butter, sosfiltfilt
+    raw = mne.io.read_raw_edf(str(path), preload=True, verbose="ERROR")
+    if abs(raw.info["sfreq"] - SFREQ) > 1e-3:
+        raw.resample(SFREQ, verbose="ERROR")
+    data = raw.get_data().astype(np.float32)
+    names = edf_labels(path)
+    if len(names) != len(data):
+        names = [c.upper() for c in raw.ch_names]
+    idx = {}
+    for i, n in enumerate(names):
+        if n and n not in DROP and n not in idx:   # второй T8-P8 отбрасывается
+            idx[n] = i
+    absent = [src for src in MAPPING.values() if src not in idx]
+    if absent and on_missing != "zero":
+        return None, absent
+    eeg = np.stack([data[idx[s]] if s in idx else np.zeros(data.shape[1], np.float32) for s in MAPPING.values()])
+    scale = np.abs(eeg).mean(0, keepdims=True)  # SCALE — относительная амплитуда (выбрано автором)
+    x = np.concatenate([eeg, scale])
+    order, lo, hi = FILTER
+    sos = butter(order, [lo, hi], btype="bandpass", fs=SFREQ, output="sos")
+    x = sosfiltfilt(sos, x.astype(np.float64), axis=-1).astype(np.float32)
+
+    win, n = int(WINDOW_SEC * SFREQ), x.shape[1]
+    sz = [(int(a * SFREQ), min(n, int(np.ceil(b * SFREQ)))) for a, b in seizures]
+    post = [(b, min(n, b + int(POSTICTAL_MIN * 60 * SFREQ))) for _, b in sz]
+    hit = lambda s, e, rr: any(s < b and e > a for a, b in rr)
+    starts, labels = [], []
+    for s in range(0, n - win + 1, win):
+        if hit(s, s + win, sz):
+            labels.append(1)
+        elif hit(s, s + win, post):
+            continue
         else:
-            print(f"  {name}: размер и SHA-256 совпали")
-    return ok
+            labels.append(0)
+        starts.append(s)
+    if not starts:
+        return None, []
+    w = np.stack([x[:, s:s + win] for s in starts])
+    return (w, np.array(labels, np.int8), np.array(starts) / SFREQ), []
 
 
-# ---------------------------- предобработка ---------------------------
-
-def process_patient(patient, cfg, raw_dir, cache_dir, force=False):
-    """Кэширует окна одного пациента. Повторный запуск пропускает готовые файлы."""
-    sig = C.preprocessing_signature(cfg)
-    out = cache_dir / patient
+def prepare_patient(patient, raw_dir, cache_dir, download=True, on_missing="skip"):
+    """Строит кэш пациента; повторный запуск ничего не пересчитывает."""
+    out = Path(cache_dir) / patient
     meta_path = out / "meta.json"
-    if meta_path.is_file() and not force:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if meta.get("signature") == sig:
-            return f"{patient}: кэш уже готов ({meta['n_windows']} окон), пропуск"
+    if meta_path.is_file() and json.loads(meta_path.read_text())["signature"] == SIGNATURE:
+        return f"{patient}: кэш готов"
+    raw_dir = Path(raw_dir)
+    if download:
+        ensure_raw(raw_dir, patient)
     summary = raw_dir / patient / f"{patient}-summary.txt"
     if not summary.is_file():
         return f"{patient}: нет {summary}, пропуск"
     out.mkdir(parents=True, exist_ok=True)
-    sfreq = float(cfg["data"]["sampling_rate_hz"])
     files, skipped, t0 = [], [], time.time()
-    for rec in C.parse_summary(summary):
-        edf = raw_dir / patient / Path(rec.file_name).name
+    for name, seizures in parse_summary(summary):
+        edf = raw_dir / patient / name
         if not edf.is_file():
-            continue          # файл не скачан — работаем с тем, что есть
+            continue
+        res, absent = load_file(edf, seizures, on_missing)
+        if res is None:
+            if absent:
+                skipped.append({"file": name, "missing": absent})
+            continue
+        w, y, st = res
         stem = edf.stem
-        try:
-            data, names, fs = C.load_edf(edf, sfreq)
-            x = C.bandpass(C.map_channels(data, names, cfg), fs, cfg)
-        except C.MissingChannels as e:
-            if str(cfg["data"]["channels"].get("on_missing")).lower() == "error":
-                raise RuntimeError(f"{edf.name}: {e}") from e
-            skipped.append({"file": edf.name, "reason": str(e)})
-            continue
-        w, y, st = C.make_windows(x, fs, rec.seizures, cfg)
-        if len(y) == 0:
-            continue
         np.save(out / f"{stem}_windows.npy", w)
         np.save(out / f"{stem}_labels.npy", y)
         np.save(out / f"{stem}_starts.npy", st)
         w64 = w.astype(np.float64)
-        files.append({
-            "file": edf.name, "windows": f"{stem}_windows.npy", "labels": f"{stem}_labels.npy",
-            "starts": f"{stem}_starts.npy", "n_windows": int(len(y)), "n_seizure": int(y.sum()),
-            "seizures": [list(s) for s in rec.seizures],
-            # статистики для глобального z-score (по каналам)
-            "ch_sum": w64.sum(axis=(0, 2)).tolist(), "ch_sumsq": (w64 ** 2).sum(axis=(0, 2)).tolist(),
-            "ch_count": int(w.shape[0] * w.shape[2]),
-        })
-    meta = {"patient": patient, "signature": sig, "sfreq": sfreq,
-            "window_sec": float(cfg["data"]["window_sec"]),
-            "n_windows": sum(f["n_windows"] for f in files),
-            "n_seizure": sum(f["n_seizure"] for f in files),
-            "files": files, "skipped_files": skipped}
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
-    return (f"{patient}: {len(files)} файлов, {meta['n_windows']} окон, из них приступ "
-            f"{meta['n_seizure']}; пропущено файлов {len(skipped)}; {time.time() - t0:.0f} с")
+        files.append({"file": name, "stem": stem, "n_windows": len(y), "n_seizure": int(y.sum()),
+                      "seizures": seizures, "ch_sum": w64.sum((0, 2)).tolist(),
+                      "ch_sumsq": (w64 ** 2).sum((0, 2)).tolist(), "ch_count": int(w.shape[0] * w.shape[2])})
+    meta = {"patient": patient, "signature": SIGNATURE, "files": files, "skipped_files": skipped,
+            "n_windows": sum(f["n_windows"] for f in files), "n_seizure": sum(f["n_seizure"] for f in files)}
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1))
+    return (f"{patient}: {len(files)} файлов, {meta['n_windows']} окон (приступ {meta['n_seizure']}), "
+            f"пропущено {len(skipped)} файлов с неполным монтажом, {time.time() - t0:.0f} с")
 
 
-def check(cfg, raw_dir, cache_dir, weights_dir, patients):
-    """Проверка наличия весов, записей и кэша без пересчёта."""
-    for name in WEIGHTS:
-        p = weights_dir / name
-        print(f"веса {name}: {'есть' if p.is_file() else 'НЕТ'}")
-    for p in patients:
-        n_edf = len(list((raw_dir / p).glob("*.edf"))) if (raw_dir / p).is_dir() else 0
-        meta = cache_dir / p / "meta.json"
-        info = "нет кэша"
-        if meta.is_file():
-            m = json.loads(meta.read_text(encoding="utf-8"))
-            info = f"кэш: {m['n_windows']} окон, приступ {m['n_seizure']}, пропущено файлов {len(m['skipped_files'])}"
-        print(f"{p}: EDF {n_edf}; {info}")
+class PatientCache:
+    """Окна пациента из кэша; сами окна читаются через memmap по требованию."""
+
+    def __init__(self, cache_dir, patient):
+        self.dir = Path(cache_dir) / patient
+        self.meta = json.loads((self.dir / "meta.json").read_text())
+        self.files = self.meta["files"]
+        self._mm = {}
+        self.labels = np.concatenate([np.load(self.dir / f"{f['stem']}_labels.npy") for f in self.files]).astype(np.int64)
+        self.starts = np.concatenate([np.load(self.dir / f"{f['stem']}_starts.npy") for f in self.files])
+        self.file_idx = np.concatenate([np.full(f["n_windows"], i) for i, f in enumerate(self.files)])
+        self.local = np.concatenate([np.arange(f["n_windows"]) for f in self.files])
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getstate__(self):  # в процессы DataLoader memmap не передаём
+        return {**self.__dict__, "_mm": {}}
+
+    def window(self, i):
+        f = int(self.file_idx[i])
+        if f not in self._mm:
+            self._mm[f] = np.load(self.dir / f"{self.files[f]['stem']}_windows.npy", mmap_mode="r")
+        return np.asarray(self._mm[f][self.local[i]], np.float32)
+
+    def channel_stats(self, file_ids=None):
+        ids = range(len(self.files)) if file_ids is None else file_ids
+        return (sum(np.array(self.files[i]["ch_sum"]) for i in ids),
+                sum(np.array(self.files[i]["ch_sumsq"]) for i in ids),
+                sum(self.files[i]["ch_count"] for i in ids))
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description="Подготовка CHB-MIT и весов BENDR (шаг 1 из 3).")
-    ap.add_argument("--config", default="configs/gpu.yaml", help="YAML-конфиг (по умолчанию configs/gpu.yaml)")
-    ap.add_argument("--patients", nargs="+", help="пациенты, по умолчанию data.patients из конфига")
-    ap.add_argument("--download", action="store_true", help="скачать записи пациентов с PhysioNet")
-    ap.add_argument("--weights", action="store_true", help="скачать и проверить веса BENDR v0.1-alpha")
-    ap.add_argument("--check", action="store_true", help="только проверить наличие данных, весов и кэша")
-    ap.add_argument("--no-preprocess", action="store_true", help="не строить кэш окон")
-    ap.add_argument("--workers", type=int, default=1, help="процессов для предобработки (по пациентам)")
-    ap.add_argument("--force", action="store_true", help="перекачать / пересчитать заново")
-    ap.add_argument("--set", nargs="*", default=[], metavar="КЛЮЧ=ЗНАЧЕНИЕ",
-                    help="переопределить ключи конфига, например data.channels.on_missing=zero")
-    args = ap.parse_args(argv)
-
-    cfg = C.apply_overrides(C.load_config(args.config), args.set)
-    paths = cfg["paths"]
-    raw_dir, cache_dir = C.resolve_path(paths["raw_dir"]), C.resolve_path(paths["cache_dir"])
-    weights_dir = C.resolve_path(paths["weights_dir"])
-    patients = args.patients or cfg["data"]["patients"]
-
-    if args.check:
-        check(cfg, raw_dir, cache_dir, weights_dir, patients)
-        return 0
-    if args.weights and not download_weights(weights_dir, args.force):
-        return 1
-    if args.download:
-        download_chbmit(raw_dir, patients, args.force)
-    if args.no_preprocess:
-        return 0
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    jobs = [(p, cfg, raw_dir, cache_dir, args.force) for p in patients]
-    if args.workers > 1:
-        with ProcessPoolExecutor(args.workers) as ex:
-            for msg in ex.map(process_patient, *zip(*jobs)):
-                print(msg, flush=True)
+def prepare_all(patients, raw_dir, cache_dir, weights_dir, workers=1, download=True, on_missing="skip"):
+    for d in (raw_dir, cache_dir, weights_dir):
+        Path(d).mkdir(parents=True, exist_ok=True)
+    ensure_weights(weights_dir)
+    if workers > 1:
+        with ProcessPoolExecutor(workers) as ex:
+            futs = [ex.submit(prepare_patient, p, raw_dir, cache_dir, download, on_missing) for p in patients]
+            for f in futs:
+                print(f.result(), flush=True)
     else:
-        for job in jobs:
-            print(process_patient(*job), flush=True)
-    return 0
+        for p in patients:
+            print(prepare_patient(p, raw_dir, cache_dir, download, on_missing), flush=True)
+
+
+def add_path_args(ap):
+    ap.add_argument("--patients", nargs="+", default=ALL_PATIENTS, help="по умолчанию chb01–chb23")
+    ap.add_argument("--raw-dir", default=str(ROOT / "data" / "chbmit"), help="записи CHB-MIT (EDF + summary)")
+    ap.add_argument("--cache-dir", default=str(ROOT / "data" / "cache"), help="кэш окон")
+    ap.add_argument("--weights-dir", default=str(ROOT / "weights"), help="encoder.pt, contextualizer.pt")
+    ap.add_argument("--no-download", action="store_true", help="не качать недостающие записи")
+    ap.add_argument("--on-missing", choices=["skip", "zero"], default="skip",
+                    help="файл с неполным монтажом: пропустить или заполнить нулями")
+    ap.add_argument("--prep-workers", type=int, default=2, help="процессов предобработки")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Скачивание и предобработка CHB-MIT, загрузка весов BENDR.")
+    add_path_args(ap)
+    a = ap.parse_args()
+    prepare_all(a.patients, a.raw_dir, a.cache_dir, a.weights_dir, a.prep_workers, not a.no_download, a.on_missing)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
