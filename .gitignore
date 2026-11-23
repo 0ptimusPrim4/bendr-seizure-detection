@@ -1,3 +1,4 @@
+# Служебное
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -6,18 +7,31 @@ __pycache__/
 .venv/
 venv/
 .env
+.python-version
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
+.DS_Store
 
+# Данные, веса, результаты, кэши и чекпоинты в репозиторий не входят
 data/raw/*
 data/processed/*
 data/annotations/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/annotations/.gitkeep
+data/chbmit/**
+!data/chbmit/.gitkeep
 
-weights/
+weights/**
+!weights/.gitkeep
 checkpoints/
 logs/
-results/
+results/**
+!results/.gitkeep
+!results/checkpoints/.gitkeep
+!results/feature_cache/.gitkeep
 runs/
 wandb/
 
@@ -29,9 +43,4 @@ wandb/
 *.pt
 *.pth
 *.ckpt
-
-.ipynb_checkpoints/
-.DS_Store
-*.egg-info/
-dist/
-build/
+*.part
