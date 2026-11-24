@@ -20,7 +20,7 @@ EDF читаются сами: 20 каналов 10-20, 256 Гц, Баттерв
 partial — последние --unfreeze-last слоёв трансформера и голова; backbone — только голова.
 Доли 25/50/100 % (--fractions) — объём обучающей выборки.
 Вход модели — как при предобучении BENDR (DN3 MappingDeep1010): окно min-max в [-1, 1] + канал SCALE (--norm bendr).
-Голова: BatchNorm1d по признакам (статистика пересчитывается перед каждой оценкой) → Linear (или --head mlp), fp32; --feature auto: при backbone —
+Голова: покомпонентная стандартизация, зафиксированная по предобученным признакам (--head-norm fixed) → Linear, fp32; --feature auto: при backbone —
 линейный зонд замороженного BENDR на первом фолде, при дообучении — ctx_mean. dropout энкодера/трансформера 0, как в дообучении BENDR.
 AdamW с раздельным lr (--lr-head / --lr-backbone), warmup + косинус до --min-lr-ratio, clip 1.0, лучшая модель по val AUC.
 Проверка, что модель вообще учится (и таблица AUC по всем признакам): python train_eval.py --sanity-overfit
@@ -312,13 +312,18 @@ def make_head(dim, kind="linear", dropout=0.0, norm="bn"):
     признаков BENDR (различия между окнами ~10 % от неё), голова учится быстро. При дообучении признаки дрейфуют
     и накопленные средние BatchNorm отстают → в eval-режиме выход насыщается (p = 0/1, val loss 100+). Поэтому
     перед каждой оценкой статистика пересчитывается на текущей магистрали (recalibrate_bn).
-    ln — LayerNorm по окну (без статистики), но на признаках BENDR учится медленно и неустойчиво при большом lr."""
-    nl = nn.BatchNorm1d(dim) if norm == "bn" else nn.LayerNorm(dim)
+    ln — LayerNorm по окну (без статистики), но на признаках BENDR учится медленно и неустойчиво при большом lr.
+    fixed — та же покомпонентная стандартизация, но среднее/σ считаются ОДИН раз по признакам предобученной
+    модели в начале обучения и дальше не меняются (BatchNorm всегда в eval-режиме). Голова тогда не инвариантна
+    к масштабу признаков: рост нормы признаков магистрали меняет логиты и штрафуется функцией потерь, а не
+    уходит «в бесконечность» незаметно (у bn градиент по масштабу/общей составляющей равен нулю). train = eval."""
+    nl = nn.BatchNorm1d(dim) if norm in ("bn", "fixed") else nn.LayerNorm(dim)
     if kind == "mlp":
         head = nn.Sequential(nl, nn.Linear(dim, 256), nn.GELU(), nn.Dropout(dropout), nn.Linear(256, 2))
     else:
         head = nn.Sequential(nl, nn.Dropout(dropout), nn.Linear(dim, 2))
-    nn.init.xavier_uniform_(head[-1].weight)
+    # последний слой с нуля: старт с p = 0,5 (на стандартизованных признаках xavier даёт логиты ~10 и loss ~7)
+    nn.init.zeros_(head[-1].weight)
     nn.init.zeros_(head[-1].bias)
     return head
 
@@ -330,6 +335,7 @@ class BENDR(nn.Module):
         # dropout энкодера и трансформера: в дообучении BENDR (BENDRClassification) он равен 0
         self.encoder, self.contextualizer = Encoder(p=dropout), Contextualizer(dropout=dropout)
         self.head = make_head(FEATURES[feature], head, head_dropout, head_norm)
+        self.head_fixed = head_norm == "fixed"
 
     ctx_fp32 = False   # --amp-scope encoder: трансформер считается в fp32 даже при AMP
 
@@ -398,6 +404,10 @@ def train_mode(model, flag):
     model.train(flag)
     for m in model._frozen:   # замороженные части без dropout
         m.eval()
+    if getattr(model, "head_fixed", False):   # фиксированная стандартизация: статистика не обновляется
+        for m in model.head.modules():
+            if isinstance(m, nn.BatchNorm1d):
+                m.eval()
 
 
 class Criterion(nn.Module):
@@ -609,10 +619,13 @@ def fit(model, tl, vl, yv, crit, a, device, dt, ckpt, log, from_feats=False, epo
     head = list(model.head.parameters())
     head_ids = {id(p) for p in head}
     bb = [p for p in model.parameters() if p.requires_grad and id(p) not in head_ids]
-    groups = [{"params": head, "lr": a.lr_head}]
+    groups = [{"params": head, "lr": a.lr_head, "weight_decay": a.weight_decay}]
     if bb and not from_feats:
-        groups.append({"params": bb, "lr": a.lr_backbone})
-    opt = torch.optim.AdamW(groups, weight_decay=a.weight_decay)
+        # weight decay магистрали только на матрицах весов (не на bias/нормировках) — сдерживает рост нормы
+        groups.append({"params": [p for p in bb if p.ndim >= 2], "lr": a.lr_backbone, "weight_decay": a.wd_backbone})
+        groups.append({"params": [p for p in bb if p.ndim < 2], "lr": a.lr_backbone, "weight_decay": 0.0})
+    groups = [g for g in groups if g["params"]]
+    opt = torch.optim.AdamW(groups)
     spe = max(1, len(tl))
     total, warm = epochs * spe, int(a.warmup * spe)
     gradual = a.unfreeze_epoch > 0 and bb and not from_feats
@@ -641,7 +654,11 @@ def fit(model, tl, vl, yv, crit, a, device, dt, ckpt, log, from_feats=False, epo
         for p in bb:
             p.requires_grad = False
         log(f"  эпохи 1–{a.unfreeze_epoch}: учится только голова, затем размораживается магистраль")
+    if getattr(model, "head_fixed", False):
+        recalibrate_bn(model, tl, device, dt, from_feats, max(a.bn_recal, 1))
+        log(f"  голова: стандартизация признаков зафиксирована по предобученной модели ({max(a.bn_recal, 1)} батчей)")
     best, bad, hist, bad_steps = -float("inf"), 0, [], 0
+    norm0 = None
     for ep in range(1, epochs + 1):
         if gradual and ep == a.unfreeze_epoch + 1:
             for p in bb:
@@ -668,7 +685,8 @@ def fit(model, tl, vl, yv, crit, a, device, dt, ckpt, log, from_feats=False, epo
             sched.step()
             tot, n = tot + float(loss.detach()) * len(y), n + len(y)
         tr = tot / max(n, 1)
-        recalibrate_bn(model, tl, device, dt, from_feats, a.bn_recal)
+        if not getattr(model, "head_fixed", False):
+            recalibrate_bn(model, tl, device, dt, from_feats, a.bn_recal)
         vloss, pv = predict(model, vl, crit, device, dt, from_feats)
         d = describe(yv, pv)
         hist.append({"epoch": ep, "train_loss": tr, "val_loss": vloss, **d, "nan_steps": bad_steps})
@@ -686,7 +704,14 @@ def fit(model, tl, vl, yv, crit, a, device, dt, ckpt, log, from_feats=False, epo
             f"Se {d['sens']:.2f} Sp {d['spec']:.2f} (порог {d['thr']:.3f}) | p {d['p_mean']:.3f}±{d['p_std']:.4f} "
             f"| lr {lrs} | {time.time() - t0:.0f} с{star}")
         if probe_x is not None:
-            log("  " + diagnose(model, probe_x.to(device), dt, from_feats))
+            line, fn = diagnose(model, probe_x.to(device), dt, from_feats)
+            log("  " + line)
+            if norm0 is None and (not gradual or ep > a.unfreeze_epoch):
+                norm0 = fn   # норма признаков в первую эпоху обучения магистрали
+            elif norm0 and fn > 100 * norm0:
+                log(f"  ВНИМАНИЕ: норма признаков выросла в {fn / norm0:.0f} раз ({norm0:.3g} → {fn:.3g}) — магистраль "
+                    f"«раздувает» признаки вместо обучения. Уменьшите --lr-backbone, увеличьте --wd-backbone, "
+                    f"проверьте --head-norm fixed; при bf16 — --amp-scope encoder.")
         if not d["finite"]:
             log("  ВНИМАНИЕ: в предсказаниях NaN/inf — попробуйте --amp off или меньше --lr-backbone")
         elif d["p_std"] < 1e-4:
@@ -709,6 +734,8 @@ def recalibrate_bn(model, dl, device, dt, from_feats, max_batches):
     bns = [m for m in model.head.modules() if isinstance(m, nn.BatchNorm1d)]
     if not bns or max_batches <= 0:
         return
+    fixed = getattr(model, "head_fixed", False)
+    model.head_fixed = False
     was = model.training
     train_mode(model, False)
     for m in bns:
@@ -722,6 +749,7 @@ def recalibrate_bn(model, dl, device, dt, from_feats, max_batches):
             logits_of(model, x.to(device, non_blocking=True), dt, from_feats)
     for m in bns:
         m.momentum = 0.1
+    model.head_fixed = fixed
     train_mode(model, was)
 
 
@@ -753,11 +781,14 @@ def diagnose(model, x, dt, from_feats):
         prec += f" | признак train/eval Δ {float((ft - f).norm() / (f.norm() + 1e-12)):.3f}"
     le = model.head(f)
     h = copy.deepcopy(model.head).train()   # копия: running stats настоящей головы не трогаем
+    if getattr(model, "head_fixed", False):
+        h.eval()
     lt = h(f)
     train_mode(model, was)
     spread = float(f.std(0).mean() / (f.abs().mean() + 1e-12))
-    return (f"диагн.: |признак| {float(f.norm(dim=1).mean()):.3g}, max {float(f.abs().max()):.3g}, разброс {spread:.3f}"
-            f"{prec} | логит eval {float(le.abs().max()):.3g}, train/eval Δлогит {float((lt - le).abs().max()):.3g}")
+    fn = float(f.norm(dim=1).mean())
+    return (f"диагн.: |признак| {fn:.3g}, max {float(f.abs().max()):.3g}, разброс {spread:.3f}"
+            f"{prec} | логит eval {float(le.abs().max()):.3g}, train/eval Δлогит {float((lt - le).abs().max()):.3g}"), fn
 
 
 def build_model(a, device, log, verbose):
@@ -813,6 +844,13 @@ def train_fold(fold, frac, caches, a, device, run_dir, log, first=False):
     if frac < 1:
         sel, _ = strat(lab(tr_it), frac, rng)
         tr_it = tr_it[sel]
+    if a.val_max and len(fold["val"]) > a.val_max and "val_full" not in fold:
+        # для ежепоэпохной оценки: все окна с приступом + случайный фон, всего --val-max окон
+        yv0 = lab(fold["val"])
+        pos, neg = np.where(yv0 == 1)[0], np.where(yv0 == 0)[0]
+        keep = np.sort(np.concatenate([pos, rng.choice(neg, max(0, a.val_max - len(pos)), replace=False)]))
+        fold["val_full"], fold["val"] = fold["val"], fold["val"][keep]
+        log(f"{tag}: val урезан до {len(keep)} окон (все {len(pos)} с приступом), --val-max {a.val_max}")
     ytr, yva, yte = lab(tr_it), lab(fold["val"]), lab(fold["test"])
     log(f"{tag}: train {len(ytr)} (приступ {ytr.sum()}, {ytr.mean():.2%}), val {len(yva)} ({yva.sum()}), "
         f"test {len(yte)} ({yte.sum()}); балансировка {a.balancing}, loss {a.loss}")
@@ -1151,9 +1189,10 @@ def main():
                     help="вход головы; auto — при backbone лучший по held-out AUC зонда, при дообучении ctx_mean; "
                          "ctx_last — как BENDRClassification, enc_pool4 — как LinearHeadBENDR; ctx_first почти постоянен")
     ap.add_argument("--head", choices=["linear", "mlp"], default="linear")
-    ap.add_argument("--head-norm", choices=["bn", "ln"], default="bn",
-                    help="нормировка входа головы: bn — по каждому признаку, статистика пересчитывается перед "
-                         "каждой оценкой (--bn-recal); ln — LayerNorm")
+    ap.add_argument("--head-norm", choices=["fixed", "bn", "ln"], default="fixed",
+                    help="нормировка входа головы: fixed — покомпонентная стандартизация по предобученным признакам, "
+                         "фиксированная (не даёт магистрали раздувать признаки); bn — BatchNorm, статистика "
+                         "пересчитывается перед каждой оценкой (--bn-recal); ln — LayerNorm")
     ap.add_argument("--bn-recal", type=int, default=50,
                     help="батчей train для пересчёта статистики BatchNorm головы перед оценкой (0 — выкл.)")
     ap.add_argument("--head-dropout", type=float, default=0.0)
@@ -1170,11 +1209,16 @@ def main():
     ap.add_argument("--warmup", type=float, default=1.0, help="эпох линейного разогрева lr, далее косинус")
     ap.add_argument("--min-lr-ratio", type=float, default=0.05, help="косинус затухает до lr·ratio, а не до 0")
     ap.add_argument("--clip", type=float, default=1.0, help="клиппинг нормы градиента")
-    ap.add_argument("--weight-decay", type=float, default=0.01)
+    ap.add_argument("--weight-decay", type=float, default=0.01, help="weight decay головы")
+    ap.add_argument("--wd-backbone", type=float, default=0.05,
+                    help="weight decay матриц весов магистрали (bias и нормировки без decay)")
     ap.add_argument("--val-fraction", type=float, default=0.2)
     ap.add_argument("--test-fraction", type=float, default=0.3, help="для patient_wise (выбрано автором)")
     ap.add_argument("--max-bg", type=int, default=None, help="урезать фон в обучающих файлах до N окон")
-    ap.add_argument("--samples-per-epoch", type=int, default=None, help="укоротить эпоху (для sampler)")
+    ap.add_argument("--samples-per-epoch", type=int, default=None,
+                    help="окон за эпоху (sampler с возвращением); короче эпоха — чаще оценка, напр. 100000")
+    ap.add_argument("--val-max", type=int, default=None,
+                    help="ежепоэпохная валидация на не более N окнах (все приступы + случайный фон), напр. 30000")
     ap.add_argument("--threshold", choices=["youden", "argmax"], default="youden")
     ap.add_argument("--vote-widths", nargs="+", type=int, default=[1, 3, 5, 7], help="1 = без пост-обработки")
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
@@ -1190,7 +1234,7 @@ def main():
     ap.add_argument("--sanity-epochs", type=int, default=60)
     ap.add_argument("--sanity-batch", type=int, default=32)
     ap.add_argument("--sanity-lr", type=float, default=1e-4, help="lr магистрали в sanity (постоянный)")
-    ap.add_argument("--sanity-lr-head", type=float, default=1e-2, help="lr головы в sanity (постоянный)")
+    ap.add_argument("--sanity-lr-head", type=float, default=3e-3, help="lr головы в sanity (постоянный)")
     ap.add_argument("--sanity-ablation", action=argparse.BooleanOptionalAction, default=True,
                     help="в sanity сначала зонд всех вариантов --feature")
     # на Windows процессы DataLoader запускаются через spawn и часто мешают — по умолчанию 0
