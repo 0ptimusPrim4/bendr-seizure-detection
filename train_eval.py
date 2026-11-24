@@ -20,7 +20,7 @@ EDF читаются сами: 20 каналов 10-20, 256 Гц, Баттерв
 partial — последние --unfreeze-last слоёв трансформера и голова; backbone — только голова.
 Доли 25/50/100 % (--fractions) — объём обучающей выборки.
 Вход модели — как при предобучении BENDR (DN3 MappingDeep1010): окно min-max в [-1, 1] + канал SCALE (--norm bendr).
-Голова: BatchNorm1d по признакам → Linear (или --head mlp) на логитах в fp32; --feature auto: при backbone —
+Голова: BatchNorm1d по признакам (статистика пересчитывается перед каждой оценкой) → Linear (или --head mlp), fp32; --feature auto: при backbone —
 линейный зонд замороженного BENDR на первом фолде, при дообучении — ctx_mean. dropout энкодера/трансформера 0, как в дообучении BENDR.
 AdamW с раздельным lr (--lr-head / --lr-backbone), warmup + косинус до --min-lr-ratio, clip 1.0, лучшая модель по val AUC.
 Проверка, что модель вообще учится (и таблица AUC по всем признакам): python train_eval.py --sanity-overfit
@@ -308,9 +308,11 @@ def pool_features(z, c=None):
 
 
 def make_head(dim, kind="linear", dropout=0.0, norm="bn"):
-    """Голова на логитах. Первый слой — нормировка КАЖДОГО признака по батчу (BatchNorm1d, как projection_mlp
-    в BENDR): у признаков BENDR большая общая для всех окон составляющая, а различия между окнами в ~10 раз
-    меньше (разброс 0,1). LayerNorm (по одному окну) её не убирает, и линейная голова учится очень медленно."""
+    """Голова на логитах. norm: bn — BatchNorm1d по каждому признаку: убирает общую для всех окон составляющую
+    признаков BENDR (различия между окнами ~10 % от неё), голова учится быстро. При дообучении признаки дрейфуют
+    и накопленные средние BatchNorm отстают → в eval-режиме выход насыщается (p = 0/1, val loss 100+). Поэтому
+    перед каждой оценкой статистика пересчитывается на текущей магистрали (recalibrate_bn).
+    ln — LayerNorm по окну (без статистики), но на признаках BENDR учится медленно и неустойчиво при большом lr."""
     nl = nn.BatchNorm1d(dim) if norm == "bn" else nn.LayerNorm(dim)
     if kind == "mlp":
         head = nn.Sequential(nl, nn.Linear(dim, 256), nn.GELU(), nn.Dropout(dropout), nn.Linear(256, 2))
@@ -329,16 +331,24 @@ class BENDR(nn.Module):
         self.encoder, self.contextualizer = Encoder(p=dropout), Contextualizer(dropout=dropout)
         self.head = make_head(FEATURES[feature], head, head_dropout, head_norm)
 
+    ctx_fp32 = False   # --amp-scope encoder: трансформер считается в fp32 даже при AMP
+
+    def _ctx(self, z):
+        if self.ctx_fp32:
+            with torch.autocast(z.device.type, enabled=False):
+                return self.contextualizer(z.float())
+        return self.contextualizer(z)
+
     def all_features(self, x):
         z = self.encoder(x)
-        return pool_features(z, self.contextualizer(z))
+        return pool_features(z, self._ctx(z))
 
     def features(self, x):
         z = self.encoder(x)
         if self.feature.startswith("enc"):
             return pool_features(z)[self.feature]
         # ctx_first — выход стартового токена; с весами v0.1-alpha почти не зависит от входа (std ≈ 0).
-        return pool_features(z, self.contextualizer(z))[self.feature]
+        return pool_features(z, self._ctx(z))[self.feature]
 
     def load_pretrained(self, enc_path, ctx_path, log=print):
         """Загрузка весов с отчётом; если не совпало больше половины ключей — остановка."""
@@ -524,8 +534,8 @@ def make_folds(a, caches, rng):
 
 def amp_dtype(a, device):
     """bf16, если GPU умеет (у bf16 нет переполнений fp16), иначе fp16 + GradScaler; на CPU — выкл."""
-    if device.type != "cuda" or a.amp == "off":
-        return None
+    if a.amp == "off" or (device.type != "cuda" and a.amp != "bf16"):
+        return None   # на CPU — fp32 (bf16 только если явно указан, для проверки)
     if a.amp == "auto":
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     return {"bf16": torch.bfloat16, "fp16": torch.float16}[a.amp]
@@ -605,15 +615,28 @@ def fit(model, tl, vl, yv, crit, a, device, dt, ckpt, log, from_feats=False, epo
     opt = torch.optim.AdamW(groups, weight_decay=a.weight_decay)
     spe = max(1, len(tl))
     total, warm = epochs * spe, int(a.warmup * spe)
-    sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, lambda s: (s + 1) / warm if s < warm else a.min_lr_ratio + (1 - a.min_lr_ratio) * 0.5 * (
-            1 + math.cos(math.pi * min(1.0, (s - warm) / max(1, total - warm)))))
+    gradual = a.unfreeze_epoch > 0 and bb and not from_feats
+    start_bb = a.unfreeze_epoch * spe if gradual else 0
+
+    def lr_curve(start):
+        # 0 до start; линейный разогрев --warmup эпох от start; косинус до lr·--min-lr-ratio к концу обучения
+        def f(s):
+            s -= start
+            if s < 0:
+                return 0.0
+            if s < warm:
+                return (s + 1) / warm
+            return a.min_lr_ratio + (1 - a.min_lr_ratio) * 0.5 * (
+                1 + math.cos(math.pi * min(1.0, (s - warm) / max(1, total - start - warm))))
+        return f
+    # у магистрали свой разогрев с момента разморозки (иначе после разморозки сразу полный lr)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, [lr_curve(0)] + [lr_curve(start_bb)] * (len(groups) - 1))
+    probe_x = next(iter(vl))[0][:64] if a.diag else None
     scaler = torch.amp.GradScaler("cuda", enabled=dt == torch.float16)
     params = [p for g in groups for p in g["params"]]
     names = {id(p): n for n, p in model.named_parameters()}
     save_names = {names[id(p)] for p in params}
     # постепенная разморозка: первые --unfreeze-epoch эпох учится только голова
-    gradual = a.unfreeze_epoch > 0 and bb and not from_feats
     if gradual:
         for p in bb:
             p.requires_grad = False
@@ -623,7 +646,7 @@ def fit(model, tl, vl, yv, crit, a, device, dt, ckpt, log, from_feats=False, epo
         if gradual and ep == a.unfreeze_epoch + 1:
             for p in bb:
                 p.requires_grad = True
-            log(f"  эпоха {ep}: магистраль разморожена")
+            log(f"  эпоха {ep}: магистраль разморожена, lr магистрали разогревается {a.warmup:g} эп. до {a.lr_backbone:g}")
         t0 = time.time()
         train_mode(model, True)
         tot = n = 0
@@ -645,6 +668,7 @@ def fit(model, tl, vl, yv, crit, a, device, dt, ckpt, log, from_feats=False, epo
             sched.step()
             tot, n = tot + float(loss.detach()) * len(y), n + len(y)
         tr = tot / max(n, 1)
+        recalibrate_bn(model, tl, device, dt, from_feats, a.bn_recal)
         vloss, pv = predict(model, vl, crit, device, dt, from_feats)
         d = describe(yv, pv)
         hist.append({"epoch": ep, "train_loss": tr, "val_loss": vloss, **d, "nan_steps": bad_steps})
@@ -652,13 +676,17 @@ def fit(model, tl, vl, yv, crit, a, device, dt, ckpt, log, from_feats=False, epo
         star = ""
         if score > best + 1e-4:
             best, bad, star = score, 0, " *"
-            torch.save({k: v.detach().cpu() for k, v in model.named_parameters() if k in save_names}, ckpt)
+            torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()
+                        if k in save_names or k.startswith("head.")}, ckpt)   # + статистика BatchNorm головы
         else:
             bad += 1
         auc_s = "NaN" if d["auc"] is None else f"{d['auc']:.3f}"
+        lrs = "/".join(f"{g['lr']:.1e}" for g in opt.param_groups)
         log(f"  эпоха {ep:3d}: train {tr:.4f} | val {vloss:.4f} AUC {auc_s} "
             f"Se {d['sens']:.2f} Sp {d['spec']:.2f} (порог {d['thr']:.3f}) | p {d['p_mean']:.3f}±{d['p_std']:.4f} "
-            f"| lr {opt.param_groups[0]['lr']:.1e} | {time.time() - t0:.0f} с{star}")
+            f"| lr {lrs} | {time.time() - t0:.0f} с{star}")
+        if probe_x is not None:
+            log("  " + diagnose(model, probe_x.to(device), dt, from_feats))
         if not d["finite"]:
             log("  ВНИМАНИЕ: в предсказаниях NaN/inf — попробуйте --amp off или меньше --lr-backbone")
         elif d["p_std"] < 1e-4:
@@ -674,16 +702,75 @@ def fit(model, tl, vl, yv, crit, a, device, dt, ckpt, log, from_feats=False, epo
     return hist
 
 
+@torch.no_grad()
+def recalibrate_bn(model, dl, device, dt, from_feats, max_batches):
+    """Пересчёт статистики BatchNorm головы на текущей магистрали (точное среднее по max_batches батчам train).
+    Без этого eval-режим использует устаревшие средние, накопленные до сдвига признаков."""
+    bns = [m for m in model.head.modules() if isinstance(m, nn.BatchNorm1d)]
+    if not bns or max_batches <= 0:
+        return
+    was = model.training
+    train_mode(model, False)
+    for m in bns:
+        m.reset_running_stats()
+        m.momentum = None          # кумулятивное среднее
+        m.train()
+    for i, (x, _) in enumerate(dl):
+        if i >= max_batches:
+            break
+        if len(x) > 1:
+            logits_of(model, x.to(device, non_blocking=True), dt, from_feats)
+    for m in bns:
+        m.momentum = 0.1
+    train_mode(model, was)
+
+
+@torch.no_grad()
+def diagnose(model, x, dt, from_feats):
+    """Одна строка диагностики на фиксированном val-батче: величина признаков, расхождение bf16/fp16 с fp32
+    и расхождение логитов головы в train- и eval-режиме (BatchNorm, dropout)."""
+    import copy
+    was = model.training
+    train_mode(model, False)
+    if from_feats:
+        f = x.float()
+        prec = ""
+    else:
+        with torch.autocast(x.device.type, dtype=dt or torch.float32, enabled=dt is not None):
+            f = model.features(x).float()
+        prec = ""
+        if dt is not None:
+            f32 = model.features(x).float()
+            prec = f" | {str(dt).split('.')[-1]}/fp32 Δ {float((f - f32).norm() / (f32.norm() + 1e-12)):.3f}"
+            train_mode(model, True)
+            with torch.autocast(x.device.type, dtype=dt, enabled=True):
+                ft = model.features(x).float()
+            train_mode(model, False)
+        else:
+            train_mode(model, True)
+            ft = model.features(x).float()
+            train_mode(model, False)
+        prec += f" | признак train/eval Δ {float((ft - f).norm() / (f.norm() + 1e-12)):.3f}"
+    le = model.head(f)
+    h = copy.deepcopy(model.head).train()   # копия: running stats настоящей головы не трогаем
+    lt = h(f)
+    train_mode(model, was)
+    spread = float(f.std(0).mean() / (f.abs().mean() + 1e-12))
+    return (f"диагн.: |признак| {float(f.norm(dim=1).mean()):.3g}, max {float(f.abs().max()):.3g}, разброс {spread:.3f}"
+            f"{prec} | логит eval {float(le.abs().max()):.3g}, train/eval Δлогит {float((lt - le).abs().max()):.3g}")
+
+
 def build_model(a, device, log, verbose):
     model = BENDR(a.feature, a.head, a.head_dropout, a.dropout, a.head_norm)
     model.load_pretrained(a.encoder, a.contextualizer, log if verbose else (lambda *_: None))
+    model.ctx_fp32 = a.amp_scope == "encoder"
     n_tr = set_freeze(model, a.freeze, a.unfreeze_last)
     n_head = sum(p.numel() for p in model.head.parameters())
     tr_enc = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
     tr_ctx = sum(p.numel() for p in model.contextualizer.parameters() if p.requires_grad)
     if verbose:
         log(f"обучаемые параметры: голова {n_head:,}, энкодер {tr_enc:,}, контекстуализатор {tr_ctx:,} "
-            f"(freeze {a.freeze}, признак {a.feature})")
+            f"(freeze {a.freeze}, признак {a.feature}, нормировка головы {a.head_norm})")
     if a.freeze != "backbone" and n_tr <= n_head:
         log(f"ВНИМАНИЕ: freeze {a.freeze} с признаком {a.feature} учит ТОЛЬКО голову ({n_head:,} параметров) — "
             f"это то же, что --freeze backbone. Для дообучения возьмите признак ctx_* или --freeze partial/full.")
@@ -827,7 +914,7 @@ def feature_ablation(a, cl, norm, tr_it, ytr, va_it, yva, device, log, tag):
     log(f"{tag}: зонд признаков (замороженный BENDR, линейная голова), train {len(ytr)} / held-out {len(yva)} окон")
     for k in FEATURES:
         rel = float(ftr[k].std(0).mean() / (ftr[k].abs().mean() + 1e-12))
-        res[k] = probe_head(ftr[k], ytr, fva[k], yva, device, a.head, a.head_norm)
+        res[k] = probe_head(ftr[k], ytr, fva[k], yva, device, a.head, "bn")
         log(f"  {k:12s} dim {ftr[k].shape[1]:5d} | разброс {rel:.4f} | train AUC {res[k][0]:.3f} | held-out AUC {res[k][1]:.3f}")
     log(f"{tag}: зонд за {time.time() - t0:.0f} с")
     return res, ftr
@@ -904,9 +991,21 @@ def sanity_overfit(a, caches, device, log):
     ckpt = Path(a.out) / "sanity_best.pt"
     hist = fit(model, tl, el, ys, Criterion("ce"), s, device, dt, ckpt, log, from_feats=fe,
                epochs=a.sanity_epochs, patience=a.sanity_epochs)
-    best = max((h["auc"] or 0) for h in hist)
-    ok = best > 0.9
-    log(f"SANITY: лучший train AUC {best:.3f} — {'OK, модель учится' if ok else 'НЕ ПРОЙДЕНО: модель не может переобучиться даже на маленьком наборе'}")
+    # Вердикт по ПОСЛЕДНИМ эпохам (текущая модель, eval-режим), а не по лучшей: случайный удачный
+    # всплеск AUC на фоне схлопнувшихся предсказаний не должен давать OK.
+    last = hist[-5:]
+    aucs = [h["auc"] or 0 for h in last]
+    fin = hist[-1]
+    checks = {
+        f"AUC последних {len(last)} эпох ≥ 0.9 (мин {min(aucs):.3f}, среднее {np.mean(aucs):.3f})": min(aucs) >= 0.9,
+        f"итоговый val loss < 0.6 и конечен ({fin['val_loss']:.3f})": bool(np.isfinite(fin["val_loss"]) and fin["val_loss"] < 0.6),
+        f"предсказания не схлопнулись (p std {fin['p_std']:.3f} > 0.05)": fin["p_std"] > 0.05,
+        f"train loss упал ({hist[0]['train_loss']:.3f} → {fin['train_loss']:.3f})": fin["train_loss"] < 0.7 * hist[0]["train_loss"],
+    }
+    for k, v in checks.items():
+        log(f"  {'✓' if v else '✗'} {k}")
+    ok = all(checks.values())
+    log(f"SANITY: {'OK, модель учится и eval-режим согласован с train' if ok else 'НЕ ПРОЙДЕНО (см. ✗ выше)'}")
     ckpt.unlink(missing_ok=True)
     return ok
 
@@ -1053,7 +1152,10 @@ def main():
                          "ctx_last — как BENDRClassification, enc_pool4 — как LinearHeadBENDR; ctx_first почти постоянен")
     ap.add_argument("--head", choices=["linear", "mlp"], default="linear")
     ap.add_argument("--head-norm", choices=["bn", "ln"], default="bn",
-                    help="нормировка входа головы: bn — по каждому признаку (рекомендуется), ln — LayerNorm")
+                    help="нормировка входа головы: bn — по каждому признаку, статистика пересчитывается перед "
+                         "каждой оценкой (--bn-recal); ln — LayerNorm")
+    ap.add_argument("--bn-recal", type=int, default=50,
+                    help="батчей train для пересчёта статистики BatchNorm головы перед оценкой (0 — выкл.)")
     ap.add_argument("--head-dropout", type=float, default=0.0)
     ap.add_argument("--dropout", type=float, default=0.0, help="dropout энкодера и трансформера (в дообучении BENDR 0)")
     ap.add_argument("--probe-n", type=int, default=2000, help="окон train для зонда --feature auto")
@@ -1062,9 +1164,9 @@ def main():
     ap.add_argument("--monitor", choices=["auc", "loss"], default="auc", help="критерий лучшей эпохи на валидации")
     ap.add_argument("--batch-size", type=int, default=64, help="BENDR дообучался батчами 4–80")
     ap.add_argument("--lr-head", type=float, default=1e-3, help="lr головы")
-    ap.add_argument("--lr-backbone", type=float, default=None,
-                    help="lr энкодера и контекстуализатора; по умолчанию 5e-5 (partial/encoder), 2e-5 (full) — "
-                         "диапазон BENDR 1e-5…5e-5")
+    ap.add_argument("--lr-backbone", type=float, default=1e-5,
+                    help="lr энкодера и контекстуализатора (BENDR дообучался с 1e-5…5e-5); после --unfreeze-epoch "
+                         "разогревается заново --warmup эпох")
     ap.add_argument("--warmup", type=float, default=1.0, help="эпох линейного разогрева lr, далее косинус")
     ap.add_argument("--min-lr-ratio", type=float, default=0.05, help="косинус затухает до lr·ratio, а не до 0")
     ap.add_argument("--clip", type=float, default=1.0, help="клиппинг нормы градиента")
@@ -1077,7 +1179,11 @@ def main():
     ap.add_argument("--vote-widths", nargs="+", type=int, default=[1, 3, 5, 7], help="1 = без пост-обработки")
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     ap.add_argument("--amp", choices=["auto", "bf16", "fp16", "off"], default="auto",
-                    help="auto — bf16, если GPU поддерживает, иначе fp16 с GradScaler")
+                    help="auto — bf16, если GPU поддерживает, иначе fp16 с GradScaler; off — всё в fp32")
+    ap.add_argument("--amp-scope", choices=["all", "encoder"], default="all",
+                    help="encoder — AMP только для свёрточного энкодера, трансформер в fp32")
+    ap.add_argument("--diag", action=argparse.BooleanOptionalAction, default=True,
+                    help="строка диагностики после каждой эпохи (признаки, bf16/fp32, train/eval)")
     ap.add_argument("--sanity-overfit", action="store_true",
                     help="быстрая проверка: переобучение на --sanity-n окнах, train AUC должен быть > 0,9")
     ap.add_argument("--sanity-n", type=int, default=400)
@@ -1125,8 +1231,6 @@ def main():
     (run_dir / "args.json").write_text(json.dumps(vars(a), ensure_ascii=False, indent=1), encoding="utf-8")
     log(f"=== {time.strftime('%Y-%m-%d %H:%M')} | {device} "
         f"{torch.cuda.get_device_name(0) if device.type == 'cuda' else ''} | пациентов {len(caches)} | {run_dir}")
-    if a.lr_backbone is None:
-        a.lr_backbone = 2e-5 if a.freeze == "full" else 5e-5
     if a.sanity_overfit:
         sys.exit(0 if sanity_overfit(a, caches, device, log) else 1)
     folds = make_folds(a, caches, np.random.default_rng(a.seed))

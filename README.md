@@ -2,10 +2,10 @@
 
 1. В `C:\Users\abuzo\Desktop\МАГИСТРАТУРА\МАГИСТЕРСКАЯ\3 семестр\scripts` лежат `train_eval.py`, `encoder.pt`, `contextualizer.pt` (BENDR v0.1-alpha); данные CHB-MIT (`chb01`, `chb02`, … с `*.edf` и `chbXX-summary.txt`) — в `...\3 семестр\data\chb-mit-scalp-eeg-database-1.0.0`. Другие пути — константы `SCRIPTS_DIR` / `DATA_DIR` в начале скрипта.
 2. Зависимости: PyTorch с CUDA (https://pytorch.org), затем `pip install -r requirements.txt`.
-3. `cd "C:\Users\abuzo\Desktop\МАГИСТРАТУРА\МАГИСТЕРСКАЯ\3 семестр\scripts"`, затем по порядку:
-   - модель учится? (зонд всех признаков + переобучение на 400 окнах, нужно AUC > 0.9): `python train_eval.py --sanity-overfit --freeze backbone`, затем `python train_eval.py --sanity-overfit --freeze partial --unfreeze-last 2`
-   - быстрая проверка (только голова, 1 пациент): `python train_eval.py --test-patients chb01 --freeze backbone --run-name check`
-   - partial: `python train_eval.py --freeze partial --unfreeze-last 2 --lr-head 1e-3 --lr-backbone 5e-5 --warmup 1 --unfreeze-epoch 2 --run-name partial2`
-   - full: `python train_eval.py --freeze full --lr-head 1e-3 --lr-backbone 2e-5 --unfreeze-epoch 2 --run-name full2`
-4. По умолчанию: вход как в BENDR (min-max окна в [-1,1] + канал SCALE, `--norm bendr`), признак `--feature auto` (при `--freeze backbone` — лучший по зонду, таблица AUC в логе; при partial/full/encoder — `ctx_mean`), partial = последние `--unfreeze-last` слоёв трансформера (для `enc_*` — свёрточных блоков энкодера); в логе печатается, сколько параметров учится в голове/энкодере/контекстуализаторе, голова BatchNorm→Linear (`--head mlp` — MLP), dropout 0, батч 64. Каждая эпоха печатает train/val loss, val AUC, Se/Sp при пороге Юдена, p mean±std. Все флаги: `python train_eval.py --help`.
-5. Результаты: `scripts\results\<run-name>\summary.csv`, кэш окон — `scripts\results\cache` (пересчитывать не нужно). Готовые фолды переиспользуются: для нового прогона — новый `--run-name` или `--force`.
+3. PowerShell: `conda activate bendr; $env:KMP_DUPLICATE_LIB_OK="TRUE"; cd "C:\Users\abuzo\Desktop\МАГИСТРАТУРА\МАГИСТЕРСКАЯ\3 семестр\scripts"`, затем по порядку:
+   - модель учится? `python train_eval.py --sanity-overfit --freeze partial --unfreeze-last 2` — OK только если AUC ≥ 0.9 во ВСЕХ последних 5 эпохах, итоговый val loss < 0.6 и предсказания не схлопнулись
+   - 1 пациент: `python train_eval.py --test-patients chb01 --freeze partial --unfreeze-last 2 --unfreeze-epoch 2 --run-name chb01_partial3`
+   - partial: `python train_eval.py --freeze partial --unfreeze-last 2 --unfreeze-epoch 2 --run-name partial3`
+   - full: `python train_eval.py --freeze full --unfreeze-epoch 2 --run-name full3`
+4. По умолчанию: вход как в BENDR (min-max окна в [-1,1] + канал SCALE), признак `auto` (backbone — по зонду, дообучение — `ctx_mean`), голова BatchNorm→Linear со статистикой, пересчитываемой перед каждой оценкой, lr головы 1e-3 / магистрали 1e-5 (после разморозки — заново разогрев `--warmup` эпох), dropout 0, батч 64, bf16. После каждой эпохи строка `диагн.:` — величина признаков, расхождение bf16/fp32 и train/eval. Если bf16/fp32 Δ > 0.05: `--amp-scope encoder` (трансформер в fp32) или `--amp off`. Все флаги: `python train_eval.py --help`.
+5. Результаты: `scripts\results\<run-name>\summary.csv`, кэш окон — `scripts\results\cache`. Готовые фолды переиспользуются: для нового прогона — новый `--run-name` или `--force`.
