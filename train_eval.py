@@ -20,7 +20,7 @@ EDF читаются сами: 20 каналов 10-20, 256 Гц, Баттерв
 partial — последние --unfreeze-last слоёв трансформера и голова; backbone — только голова.
 Доли 25/50/100 % (--fractions) — объём обучающей выборки.
 Вход модели — как при предобучении BENDR (DN3 MappingDeep1010): окно min-max в [-1, 1] + канал SCALE (--norm bendr).
-Голова: покомпонентная стандартизация, зафиксированная по предобученным признакам (--head-norm fixed) → Linear, fp32; --feature auto: при backbone —
+Голова: BatchNorm (пересчёт статистики перед оценкой) → Linear, fp32, + штраф нормы признаков --feat-reg; --feature auto: при backbone —
 линейный зонд замороженного BENDR на первом фолде, при дообучении — ctx_mean. dropout энкодера/трансформера 0, как в дообучении BENDR.
 AdamW с раздельным lr (--lr-head / --lr-backbone), warmup + косинус до --min-lr-ratio, clip 1.0, лучшая модель по val AUC.
 Проверка, что модель вообще учится (и таблица AUC по всем признакам): python train_eval.py --sanity-overfit
@@ -313,10 +313,10 @@ def make_head(dim, kind="linear", dropout=0.0, norm="bn"):
     и накопленные средние BatchNorm отстают → в eval-режиме выход насыщается (p = 0/1, val loss 100+). Поэтому
     перед каждой оценкой статистика пересчитывается на текущей магистрали (recalibrate_bn).
     ln — LayerNorm по окну (без статистики), но на признаках BENDR учится медленно и неустойчиво при большом lr.
-    fixed — та же покомпонентная стандартизация, но среднее/σ считаются ОДИН раз по признакам предобученной
-    модели в начале обучения и дальше не меняются (BatchNorm всегда в eval-режиме). Голова тогда не инвариантна
-    к масштабу признаков: рост нормы признаков магистрали меняет логиты и штрафуется функцией потерь, а не
-    уходит «в бесконечность» незаметно (у bn градиент по масштабу/общей составляющей равен нулю). train = eval."""
+    fixed — та же стандартизация, но среднее/σ считаются один раз по предобученной модели и не меняются.
+    Норма признаков ограничена, но σ у признаков крошечные, и малый сдвиг общей составляющей превращается
+    в большие скачки смещения логитов (p̄ 0,02 ↔ 0,98 между эпохами) — поэтому по умолчанию bn + --feat-reg:
+    bn не видит масштаба признаков, и рост нормы сдерживает отдельный штраф в fit."""
     nl = nn.BatchNorm1d(dim) if norm in ("bn", "fixed") else nn.LayerNorm(dim)
     if kind == "mlp":
         head = nn.Sequential(nl, nn.Linear(dim, 256), nn.GELU(), nn.Dropout(dropout), nn.Linear(256, 2))
@@ -560,14 +560,16 @@ def loader(ds, y, a, train, device, workers):
     return DataLoader(ds, shuffle=train, **kw)
 
 
-def logits_of(model, x, dt, from_feats):
+def logits_of(model, x, dt, from_feats, with_feats=False):
     """Магистраль BENDR — в смешанной точности, голова и softmax — всегда в fp32."""
     if from_feats:
         f = x
     else:
         with torch.autocast(x.device.type, dtype=dt or torch.float32, enabled=dt is not None):
             f = model.features(x)
-    return model.head(f.float())
+    f = f.float()
+    lg = model.head(f)
+    return (lg, f) if with_feats else lg
 
 
 @torch.no_grad()
@@ -657,6 +659,14 @@ def fit(model, tl, vl, yv, crit, a, device, dt, ckpt, log, from_feats=False, epo
     if getattr(model, "head_fixed", False):
         recalibrate_bn(model, tl, device, dt, from_feats, max(a.bn_recal, 1))
         log(f"  голова: стандартизация признаков зафиксирована по предобученной модели ({max(a.bn_recal, 1)} батчей)")
+    reg_on = a.feat_reg > 0 and bool(bb) and not from_feats
+    if reg_on:
+        with torch.no_grad():
+            train_mode(model, False)
+            xb = next(iter(tl))[0].to(device)
+            _, f0 = logits_of(model, xb, dt, from_feats, with_feats=True)
+            ref_norm = float(f0.norm(dim=1).mean())
+        log(f"  штраф нормы признаков: λ {a.feat_reg:g}, опорная |признак| {ref_norm:.3g} (предобученная модель)")
     best, bad, hist, bad_steps = -float("inf"), 0, [], 0
     norm0 = None
     for ep in range(1, epochs + 1):
@@ -671,7 +681,12 @@ def fit(model, tl, vl, yv, crit, a, device, dt, ckpt, log, from_feats=False, epo
             if len(y) < 2:              # BatchNorm в голове не работает на батче из одного окна
                 continue
             x, y = x.to(device, non_blocking=True), y.to(device).long()
-            loss = crit(logits_of(model, x, dt, from_feats), y)
+            lg, f = logits_of(model, x, dt, from_feats, with_feats=True)
+            loss = crit(lg, y)
+            if reg_on and any(p.requires_grad for p in bb):
+                # штраф за уход нормы признаков от предобученной: BatchNorm-голова не видит масштаба,
+                # и без штрафа магистраль раздувает признаки (|f| 0,14 → 9e4 на chb01)
+                loss = loss + a.feat_reg * torch.log(f.norm(dim=1).mean() / ref_norm) ** 2
             opt.zero_grad(set_to_none=True)
             if not torch.isfinite(loss):
                 bad_steps += 1          # шаг с NaN/inf пропускается
@@ -1189,10 +1204,12 @@ def main():
                     help="вход головы; auto — при backbone лучший по held-out AUC зонда, при дообучении ctx_mean; "
                          "ctx_last — как BENDRClassification, enc_pool4 — как LinearHeadBENDR; ctx_first почти постоянен")
     ap.add_argument("--head", choices=["linear", "mlp"], default="linear")
-    ap.add_argument("--head-norm", choices=["fixed", "bn", "ln"], default="fixed",
-                    help="нормировка входа головы: fixed — покомпонентная стандартизация по предобученным признакам, "
-                         "фиксированная (не даёт магистрали раздувать признаки); bn — BatchNorm, статистика "
-                         "пересчитывается перед каждой оценкой (--bn-recal); ln — LayerNorm")
+    ap.add_argument("--head-norm", choices=["bn", "fixed", "ln"], default="bn",
+                    help="нормировка входа головы: bn — BatchNorm, статистика пересчитывается перед каждой оценкой "
+                         "(--bn-recal), рост нормы признаков сдерживает --feat-reg; fixed — стандартизация, "
+                         "зафиксированная по предобученным признакам (смещение логитов неустойчиво); ln — LayerNorm")
+    ap.add_argument("--feat-reg", type=float, default=1.0,
+                    help="λ штрафа λ·log²(|признак| / |признак предобученной модели|) при обучении магистрали (0 — выкл.)")
     ap.add_argument("--bn-recal", type=int, default=50,
                     help="батчей train для пересчёта статистики BatchNorm головы перед оценкой (0 — выкл.)")
     ap.add_argument("--head-dropout", type=float, default=0.0)
