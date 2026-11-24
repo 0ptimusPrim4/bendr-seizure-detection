@@ -20,8 +20,8 @@ EDF читаются сами: 20 каналов 10-20, 256 Гц, Баттерв
 partial — последние --unfreeze-last слоёв трансформера и голова; backbone — только голова.
 Доли 25/50/100 % (--fractions) — объём обучающей выборки.
 Вход модели — как при предобучении BENDR (DN3 MappingDeep1010): окно min-max в [-1, 1] + канал SCALE (--norm bendr).
-Голова: BatchNorm1d по признакам → Linear (или --head mlp) на логитах в fp32; признак --feature auto выбирается
-линейным зондом замороженного BENDR на первом фолде. dropout энкодера/трансформера 0, как в дообучении BENDR.
+Голова: BatchNorm1d по признакам → Linear (или --head mlp) на логитах в fp32; --feature auto: при backbone —
+линейный зонд замороженного BENDR на первом фолде, при дообучении — ctx_mean. dropout энкодера/трансформера 0, как в дообучении BENDR.
 AdamW с раздельным lr (--lr-head / --lr-backbone), warmup + косинус до --min-lr-ratio, clip 1.0, лучшая модель по val AUC.
 Проверка, что модель вообще учится (и таблица AUC по всем признакам): python train_eval.py --sanity-overfit
 Метрики до/после пост-обработки (голосование в нечётном окне, группировка FP) — <out>/<run>/summary.csv.
@@ -360,14 +360,22 @@ class BENDR(nn.Module):
 
 
 def set_freeze(model, mode, k):
+    """Что учится в каждом режиме.
+    Признак ctx_*: full — всё; encoder — контекстуализатор (энкодер заморожен); partial — последние k слоёв
+    трансформера + выходной слой; backbone — только голова.
+    Признак enc_* (контекстуализатор не нужен и всегда заморожен): full — весь энкодер; partial — последние k
+    свёрточных блоков энкодера (из 6); encoder и backbone — только голова."""
     for p in model.parameters():
         p.requires_grad = True
-    ctx = model.contextualizer
-    frozen = {"full": [], "encoder": [model.encoder], "backbone": [model.encoder, ctx],
-              "partial": [model.encoder, ctx.relative_position, ctx.input_conditioning,
-                          *ctx.transformer_layers[:len(ctx.transformer_layers) - k]]}[mode]
-    if model.feature.startswith("enc"):   # признак энкодера — контекстуализатор не используется
-        frozen = [*frozen, ctx]
+    ctx, enc = model.contextualizer, model.encoder
+    blocks = list(enc.encoder)
+    if model.feature.startswith("enc"):
+        frozen = {"full": [ctx], "encoder": [enc, ctx], "backbone": [enc, ctx],
+                  "partial": [ctx, *blocks[:max(0, len(blocks) - k)]]}[mode]
+    else:
+        frozen = {"full": [], "encoder": [enc], "backbone": [enc, ctx],
+                  "partial": [enc, ctx.relative_position, ctx.input_conditioning,
+                              *ctx.transformer_layers[:max(0, len(ctx.transformer_layers) - k)]]}[mode]
     for m in frozen:
         for p in m.parameters():
             p.requires_grad = False
@@ -670,6 +678,15 @@ def build_model(a, device, log, verbose):
     model = BENDR(a.feature, a.head, a.head_dropout, a.dropout, a.head_norm)
     model.load_pretrained(a.encoder, a.contextualizer, log if verbose else (lambda *_: None))
     n_tr = set_freeze(model, a.freeze, a.unfreeze_last)
+    n_head = sum(p.numel() for p in model.head.parameters())
+    tr_enc = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+    tr_ctx = sum(p.numel() for p in model.contextualizer.parameters() if p.requires_grad)
+    if verbose:
+        log(f"обучаемые параметры: голова {n_head:,}, энкодер {tr_enc:,}, контекстуализатор {tr_ctx:,} "
+            f"(freeze {a.freeze}, признак {a.feature})")
+    if a.freeze != "backbone" and n_tr <= n_head:
+        log(f"ВНИМАНИЕ: freeze {a.freeze} с признаком {a.feature} учит ТОЛЬКО голову ({n_head:,} параметров) — "
+            f"это то же, что --freeze backbone. Для дообучения возьмите признак ctx_* или --freeze partial/full.")
     return model.to(device), n_tr
 
 
@@ -816,8 +833,28 @@ def feature_ablation(a, cl, norm, tr_it, ytr, va_it, yva, device, log, tag):
     return res, ftr
 
 
+FINETUNE_FEATURE = "ctx_mean"
+
+
+def auto_feature(a, res, log, tag):
+    """--feature auto. Зонд меряет только замороженные признаки, поэтому решает лишь при --freeze backbone.
+    При дообучении (encoder/partial/full) берётся признак контекстуализатора ctx_mean: учатся слои трансформера,
+    а не зондированные признаки (BENDR использует ctx_last; ctx_mean у вас на зонде лучше — выбрано автором)."""
+    if a.freeze != "backbone" or res is None:
+        log(f"{tag}: --feature auto → {FINETUNE_FEATURE} (freeze {a.freeze}: дообучение, признак контекстуализатора)")
+        return FINETUNE_FEATURE
+    best = max((k for k in res if k != "ctx_first"), key=lambda k: res[k][1] or 0)
+    log(f"{tag}: --feature auto → {best} (freeze backbone: лучший held-out AUC зонда {res[best][1]:.3f})")
+    if res[best][1] is not None and res[best][1] < 0.65:
+        log(f"  ВНИМАНИЕ: замороженные признаки почти не разделяют классы (held-out AUC < 0.65) — "
+            f"ожидайте слабый результат backbone; нужен partial/full.")
+    return best
+
+
 def choose_feature(a, caches, fold, device, log):
-    """--feature auto: лучший признак по held-out AUC линейного зонда на первом фолде (train → val)."""
+    """--feature auto для обучения: при backbone — зонд на первом фолде (train → val), иначе ctx_mean."""
+    if a.freeze != "backbone":
+        return auto_feature(a, None, log, "AUTO")
     names = list(caches)
     cl = [caches[n] for n in names]
     lab = lambda it: np.array([cl[c].labels[i] for c, i in it], np.int64)
@@ -825,9 +862,7 @@ def choose_feature(a, caches, fold, device, log):
     tr_it, ytr = balanced_pick(fold["train"], lab(fold["train"]), a.probe_n, rng)
     va_it, yva = balanced_pick(fold["val"], lab(fold["val"]), a.probe_n // 2, rng)
     res, _ = feature_ablation(a, cl, make_norm(a, fold), tr_it, ytr, va_it, yva, device, log, "AUTO")
-    best = max((k for k in res if k != "ctx_first"), key=lambda k: res[k][1] or 0)
-    log(f"AUTO: --feature {best} (held-out AUC {res[best][1]:.3f}); выбор фиксируется для всех фолдов")
-    return best
+    return auto_feature(a, res, log, "AUTO")
 
 
 def sanity_overfit(a, caches, device, log):
@@ -843,11 +878,11 @@ def sanity_overfit(a, caches, device, log):
     it, ys = balanced_pick(fold["train"], lab(fold["train"]), a.sanity_n, rng)
     va_it, yva = balanced_pick(fold["val"], lab(fold["val"]), a.sanity_n, rng)
     norm = make_norm(a, fold)
-    feats = None
-    if a.feature == "auto" or a.sanity_ablation:
+    feats = res = None
+    if a.sanity_ablation or (a.feature == "auto" and a.freeze == "backbone"):
         res, feats = feature_ablation(a, cl, norm, it, ys, va_it, yva, device, log, "SANITY")
-        if a.feature == "auto":
-            a.feature = max((k for k in res if k != "ctx_first"), key=lambda k: res[k][1] or 0)
+    if a.feature == "auto":
+        a.feature = auto_feature(a, res, log, "SANITY")
     s = argparse.Namespace(**vars(a))
     s.balancing, s.loss, s.dropout, s.head_dropout = "none", "ce", 0.0, 0.0
     s.weight_decay, s.warmup, s.min_lr_ratio, s.unfreeze_epoch, s.monitor = 0.0, 0.0, 1.0, 0, "auc"
@@ -1001,7 +1036,8 @@ def main():
     ap.add_argument("--freeze", choices=["full", "encoder", "partial", "backbone"], default="full",
                     help="full — всё; encoder — заморожен свёрточный энкодер; partial — учатся последние "
                          "--unfreeze-last слоёв трансформера; backbone — только голова")
-    ap.add_argument("--unfreeze-last", type=int, default=2, help="для partial (выбрано автором)")
+    ap.add_argument("--unfreeze-last", type=int, default=2,
+                    help="для partial: последние N слоёв трансформера (признак ctx_*) или свёрточных блоков энкодера (enc_*)")
     ap.add_argument("--unfreeze-epoch", type=int, default=0,
                     help="постепенная разморозка: первые N эпох учится только голова (0 — выкл.)")
     ap.add_argument("--fractions", nargs="+", type=float, default=[1.0], help="например 0.25 0.5 1.0")
@@ -1013,7 +1049,7 @@ def main():
                     help="bendr — min-max окна в [-1,1] + канал SCALE, как при предобучении BENDR (DN3)")
     ap.add_argument("--max-scale", type=float, default=MAX_SCALE, help="размах (В), для канала SCALE при --norm bendr")
     ap.add_argument("--feature", choices=["auto", *FEATURES], default="auto",
-                    help="вход головы; auto — лучший по held-out AUC линейного зонда на первом фолде; "
+                    help="вход головы; auto — при backbone лучший по held-out AUC зонда, при дообучении ctx_mean; "
                          "ctx_last — как BENDRClassification, enc_pool4 — как LinearHeadBENDR; ctx_first почти постоянен")
     ap.add_argument("--head", choices=["linear", "mlp"], default="linear")
     ap.add_argument("--head-norm", choices=["bn", "ln"], default="bn",
