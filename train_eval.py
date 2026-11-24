@@ -19,6 +19,9 @@ EDF читаются сами: 20 каналов 10-20, 256 Гц, Баттерв
 Режимы --freeze: full — учится всё (диссертация); encoder — заморожен свёрточный энкодер;
 partial — последние --unfreeze-last слоёв трансформера и голова; backbone — только голова.
 Доли 25/50/100 % (--fractions) — объём обучающей выборки.
+Обучение: голова LayerNorm→Linear на логитах (fp32), признак ctx_mean, AdamW с раздельным lr
+(--lr-head / --lr-backbone), warmup + косинус, clip 1.0, лучшая модель по val AUC.
+Проверка, что модель вообще учится: python train_eval.py --sanity-overfit
 Метрики до/после пост-обработки (голосование в нечётном окне, группировка FP) — <out>/<run>/summary.csv.
 """
 
@@ -26,6 +29,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import re
 import sys
 import time
@@ -270,7 +274,7 @@ class Contextualizer(nn.Module):
             layer.norm1, layer.norm2 = Identity(), Identity()   # T-Fixup, как в BENDR
             self.transformer_layers.append(layer)
         self.norm = nn.LayerNorm(d)
-        self.mask_replacement = nn.Parameter(torch.zeros(h))
+        self.mask_replacement = nn.Parameter(torch.zeros(h))   # используется только при предобучении
         self.output_layer = nn.Conv1d(d, h, 1)
 
     def forward(self, x):
@@ -282,27 +286,42 @@ class Contextualizer(nn.Module):
 
 
 class BENDR(nn.Module):
-    def __init__(self, feature="ctx_first"):
+    def __init__(self, feature="ctx_mean", head_dropout=0.0):
         super().__init__()
         self.feature = feature
         self.encoder, self.contextualizer = Encoder(), Contextualizer()
-        self.head = nn.Sequential(nn.Linear(512, 2), nn.Softmax(-1))
+        # Голова возвращает логиты (softmax — в функции потерь, в fp32).
+        # LayerNorm нужен потому, что признаки BENDR очень малы по модулю (норма ~0,1) — выбрано автором.
+        self.head = nn.Sequential(nn.LayerNorm(512), nn.Dropout(head_dropout), nn.Linear(512, 2))
+        nn.init.xavier_uniform_(self.head[2].weight)
+        nn.init.zeros_(self.head[2].bias)
 
     def features(self, x):
         z = self.encoder(x)
         if self.feature == "enc_mean":
             return z.mean(-1)
         c = self.contextualizer(z)
-        return c[:, :, 0] if self.feature == "ctx_first" else c[:, :, 1:].mean(-1)
+        # ctx_first — выход стартового токена; при предобучении BENDR он не обучался и с весами
+        # v0.1-alpha почти не зависит от входа (проверено: std между окнами ≈ 0).
+        return {"ctx_first": c[:, :, 0], "ctx_last": c[:, :, -1], "ctx_mean": c[:, :, 1:].mean(-1)}[self.feature]
 
-    def forward(self, x):
-        return self.head(self.features(x))
-
-    def load_pretrained(self, enc_path, ctx_path):
+    def load_pretrained(self, enc_path, ctx_path, log=print):
+        """Загрузка весов с отчётом; если не совпало больше половины ключей — остановка."""
         for name, mod, path in (("encoder", self.encoder, enc_path), ("contextualizer", self.contextualizer, ctx_path)):
-            miss, unexp = mod.load_state_dict(torch.load(path, map_location="cpu", weights_only=True), strict=False)
-            if miss or unexp:
-                print(f"ВНИМАНИЕ: {name}.pt загружен не полностью: {miss} {unexp}")
+            state = torch.load(path, map_location="cpu", weights_only=True)
+            own = mod.state_dict()
+            shape_bad = [k for k in state if k in own and own[k].shape != state[k].shape]
+            for k in shape_bad:
+                state.pop(k)
+            miss, unexp = mod.load_state_dict(state, strict=False)
+            loaded = len(own) - len(miss)
+            log(f"веса {name}: загружено {loaded}/{len(own)} тензоров; нет в файле {len(miss)}, "
+                f"лишних {len(unexp)}, не совпала форма {len(shape_bad)}")
+            if miss or unexp or shape_bad:
+                log(f"  нет: {list(miss)[:5]} лишние: {list(unexp)[:5]} форма: {shape_bad[:5]}")
+            if loaded < 0.5 * len(own):
+                sys.exit(f"ОШИБКА: {path} почти не подошёл к модели ({loaded}/{len(own)}) — "
+                         f"энкодер остался бы случайным. Проверьте, что это веса BENDR v0.1-alpha.")
 
 
 def set_freeze(model, mode, k):
@@ -312,11 +331,10 @@ def set_freeze(model, mode, k):
     frozen = {"full": [], "encoder": [model.encoder], "backbone": [model.encoder, ctx],
               "partial": [model.encoder, ctx.relative_position, ctx.input_conditioning,
                           *ctx.transformer_layers[:len(ctx.transformer_layers) - k]]}[mode]
-    if mode == "partial":
-        ctx.mask_replacement.requires_grad = False
     for m in frozen:
         for p in m.parameters():
             p.requires_grad = False
+    ctx.mask_replacement.requires_grad = False   # в дообучении не участвует
     model._frozen = frozen
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -327,19 +345,30 @@ def train_mode(model, flag):
         m.eval()
 
 
-class SSWCE(nn.Module):
-    """L = CE + α(1 − спец.) + β(1 − чувств.), α = 0,3, β = 0,5 (Benfenati, ур. 5.9)."""
+class Criterion(nn.Module):
+    """sswce: CE + α(1 − спец.) + β(1 − чувств.), α = 0,3, β = 0,5 (Benfenati, ур. 5.9);
+    ce — обычная кросс-энтропия; focal — фокальная (γ = --focal-gamma, выбрано автором).
+    weights — веса классов (только при --balancing class_weights, чтобы не балансировать дважды)."""
 
-    def __init__(self, alpha=0.3, beta=0.5, weights=None):
+    def __init__(self, kind="sswce", weights=None, alpha=0.3, beta=0.5, gamma=2.0):
         super().__init__()
-        self.a, self.b = alpha, beta
+        self.kind, self.a, self.b, self.g = kind, alpha, beta, gamma
         self.w = None if weights is None else torch.tensor(weights, dtype=torch.float32)
 
-    def forward(self, probs, y):
-        probs = probs.float()
-        w = None if self.w is None else self.w.to(probs.device)
-        ce = F.nll_loss(torch.log(probs.clamp(min=1e-7)), y, weight=w)
-        p1, yf = probs[:, 1], y.float()
+    def forward(self, logits, y):
+        logits = logits.float()
+        w = None if self.w is None else self.w.to(logits.device)
+        logp = F.log_softmax(logits, -1)
+        if self.kind == "focal":
+            lp = logp.gather(1, y[:, None])[:, 0]
+            loss = -((1 - lp.exp()) ** self.g) * lp
+            if w is not None:
+                loss = loss * w[y]
+            return loss.mean()
+        ce = F.nll_loss(logp, y, weight=w)
+        if self.kind == "ce":
+            return ce
+        p1, yf = logp[:, 1].exp(), y.float()
         sens = (p1 * yf).sum() / yf.sum().clamp(min=1)
         spec = ((1 - p1) * (1 - yf)).sum() / (1 - yf).sum().clamp(min=1)
         return ce + self.a * (1 - spec) + self.b * (1 - sens)
@@ -358,7 +387,7 @@ class Windows(Dataset):
     def __getitem__(self, k):
         c, i = self.items[k]
         x = self.caches[c].window(i)
-        if self.norm is None:   # z-score внутри окна
+        if self.norm is None:   # z-score каждого канала внутри окна
             s = x.std(-1, keepdims=True)
             x = (x - x.mean(-1, keepdims=True)) / np.where(s < 1e-8, 1, s)
         else:                   # глобальный z-score по обучающим пациентам
@@ -432,6 +461,15 @@ def make_folds(a, caches, rng):
 
 # --------------------------------------------------------------- обучение
 
+def amp_dtype(a, device):
+    """bf16, если GPU умеет (у bf16 нет переполнений fp16), иначе fp16 + GradScaler; на CPU — выкл."""
+    if device.type != "cuda" or a.amp == "off":
+        return None
+    if a.amp == "auto":
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return {"bf16": torch.bfloat16, "fp16": torch.float16}[a.amp]
+
+
 def loader(ds, y, a, train, device, workers):
     kw = dict(batch_size=a.batch_size, num_workers=workers, pin_memory=device.type == "cuda")
     if train and a.balancing == "sampler":   # WeightedRandomSampler, веса обратны частоте класса
@@ -441,67 +479,167 @@ def loader(ds, y, a, train, device, workers):
     return DataLoader(ds, shuffle=train, **kw)
 
 
-def run(net, model, dl, crit, device, amp, opt=None, scaler=None):
-    train_mode(model, opt is not None)
-    tot = n = 0
-    with torch.set_grad_enabled(opt is not None):
-        for x, y in dl:
-            x, y = x.to(device, non_blocking=True), y.to(device).long()
-            with torch.autocast(device.type, dtype=torch.float16, enabled=amp):
-                loss = crit(net(x), y)
-            if opt is not None:
-                opt.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
-                scaler.step(opt)
-                scaler.update()
-            tot, n = tot + float(loss) * len(y), n + len(y)
-    return tot / max(n, 1)
+def logits_of(model, x, dt, from_feats):
+    """Магистраль BENDR — в смешанной точности, голова и softmax — всегда в fp32."""
+    if from_feats:
+        f = x
+    else:
+        with torch.autocast(x.device.type, dtype=dt or torch.float32, enabled=dt is not None):
+            f = model.features(x)
+    return model.head(f.float())
 
 
 @torch.no_grad()
-def predict(net, model, dl, device, amp, feats=False):
+def predict(model, dl, crit, device, dt, from_feats):
+    """Возвращает (средний loss, p(приступ)) — один проход в eval-режиме."""
+    train_mode(model, False)
+    ps, tot, n = [], 0.0, 0
+    for x, y in dl:
+        x, y = x.to(device, non_blocking=True), y.to(device).long()
+        lg = logits_of(model, x, dt, from_feats)
+        tot, n = tot + float(crit(lg, y)) * len(y), n + len(y)
+        ps.append(torch.softmax(lg, -1)[:, 1].cpu().numpy())
+    return tot / max(n, 1), (np.concatenate(ps) if ps else np.empty(0))
+
+
+@torch.no_grad()
+def extract(model, dl, device, dt):
     train_mode(model, False)
     out = []
     for x, _ in dl:
-        with torch.autocast(device.type, dtype=torch.float16, enabled=amp):
-            r = (model.features if feats else net)(x.to(device, non_blocking=True)).float().cpu()
-        out.append(r if feats else r[:, 1].numpy())
-    return torch.cat(out) if feats else np.concatenate(out)
-
-
-def fit(net, model, tl, vl, crit, a, device, amp, ckpt, log):
-    opt = torch.optim.Adam([p for p in net.parameters() if p.requires_grad], lr=a.lr, weight_decay=a.weight_decay)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.1, patience=5)
-    scaler = torch.amp.GradScaler(device.type, enabled=amp)
-    best, bad, hist = float("inf"), 0, []
-    for ep in range(1, a.epochs + 1):
-        t0 = time.time()
-        tr = run(net, model, tl, crit, device, amp, opt, scaler)
-        va = run(net, model, vl, crit, device, amp)
-        sched.step(va)
-        hist.append({"epoch": ep, "train_loss": tr, "val_loss": va})
-        if va < best - 1e-4:
-            best, bad = va, 0
-            torch.save({k: v.detach().cpu() for k, v in model.named_parameters() if v.requires_grad}, ckpt)
-        else:
-            bad += 1
-        log(f"  эпоха {ep:3d}: train {tr:.4f}  val {va:.4f}  {time.time() - t0:.0f} с{' *' if bad == 0 else ''}")
-        if bad >= a.patience:
-            log("  ранняя остановка")
-            break
-    model.load_state_dict(torch.load(ckpt, weights_only=True), strict=False)
-    return hist
+        with torch.autocast(device.type, dtype=dt or torch.float32, enabled=dt is not None):
+            out.append(model.features(x.to(device, non_blocking=True)).float().cpu())
+    return torch.cat(out)
 
 
 def youden(y, p):
     from sklearn.metrics import roc_curve
-    if len(np.unique(y)) < 2:
+    if len(np.unique(y)) < 2 or not np.isfinite(p).all():
         return 0.5
     fpr, tpr, thr = roc_curve(y, p)
     return float(thr[1:][np.argmax((tpr - fpr)[1:])])
 
 
-def train_fold(fold, frac, caches, a, device, run_dir, log):
+def describe(y, p):
+    """AUC, порог Юдена и чувствительность/специфичность при нём, статистика вероятностей."""
+    finite = bool(np.isfinite(p).all())
+    thr = youden(y, p) if finite else 0.5
+    pr = p >= thr
+    sens = float((pr & (y == 1)).sum() / max(1, (y == 1).sum()))
+    spec = float((~pr & (y == 0)).sum() / max(1, (y == 0).sum()))
+    return {"auc": auc(y, p) if finite else None, "thr": thr, "sens": sens, "spec": spec,
+            "p_mean": float(np.nanmean(p)), "p_std": float(np.nanstd(p)), "finite": finite}
+
+
+def fit(model, tl, vl, yv, crit, a, device, dt, ckpt, log, from_feats=False, epochs=None, patience=None):
+    """Цикл обучения: AdamW с разными lr для головы и магистрали, warmup + косинус,
+    клиппинг градиента, защита от NaN, выбор лучшей эпохи по val AUC."""
+    epochs, patience = epochs or a.epochs, patience or a.patience
+    head = list(model.head.parameters())
+    head_ids = {id(p) for p in head}
+    bb = [p for p in model.parameters() if p.requires_grad and id(p) not in head_ids]
+    groups = [{"params": head, "lr": a.lr_head}]
+    if bb and not from_feats:
+        groups.append({"params": bb, "lr": a.lr_backbone})
+    opt = torch.optim.AdamW(groups, weight_decay=a.weight_decay)
+    spe = max(1, len(tl))
+    total, warm = epochs * spe, int(a.warmup * spe)
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, lambda s: (s + 1) / warm if s < warm else 0.5 * (1 + math.cos(math.pi * min(1.0, (s - warm) / max(1, total - warm)))))
+    scaler = torch.amp.GradScaler("cuda", enabled=dt == torch.float16)
+    params = [p for g in groups for p in g["params"]]
+    names = {id(p): n for n, p in model.named_parameters()}
+    save_names = {names[id(p)] for p in params}
+    # постепенная разморозка: первые --unfreeze-epoch эпох учится только голова
+    gradual = a.unfreeze_epoch > 0 and bb and not from_feats
+    if gradual:
+        for p in bb:
+            p.requires_grad = False
+        log(f"  эпохи 1–{a.unfreeze_epoch}: учится только голова, затем размораживается магистраль")
+    best, bad, hist, bad_steps = -float("inf"), 0, [], 0
+    for ep in range(1, epochs + 1):
+        if gradual and ep == a.unfreeze_epoch + 1:
+            for p in bb:
+                p.requires_grad = True
+            log(f"  эпоха {ep}: магистраль разморожена")
+        t0 = time.time()
+        train_mode(model, True)
+        tot = n = 0
+        for x, y in tl:
+            x, y = x.to(device, non_blocking=True), y.to(device).long()
+            loss = crit(logits_of(model, x, dt, from_feats), y)
+            opt.zero_grad(set_to_none=True)
+            if not torch.isfinite(loss):
+                bad_steps += 1          # шаг с NaN/inf пропускается
+                sched.step()
+                continue
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_([p for p in params if p.grad is not None], a.clip)
+            scaler.step(opt)
+            scaler.update()
+            sched.step()
+            tot, n = tot + float(loss.detach()) * len(y), n + len(y)
+        tr = tot / max(n, 1)
+        vloss, pv = predict(model, vl, crit, device, dt, from_feats)
+        d = describe(yv, pv)
+        hist.append({"epoch": ep, "train_loss": tr, "val_loss": vloss, **d, "nan_steps": bad_steps})
+        score = (d["auc"] if d["auc"] is not None else -1) if a.monitor == "auc" else -vloss
+        star = ""
+        if score > best + 1e-4:
+            best, bad, star = score, 0, " *"
+            torch.save({k: v.detach().cpu() for k, v in model.named_parameters() if k in save_names}, ckpt)
+        else:
+            bad += 1
+        auc_s = "NaN" if d["auc"] is None else f"{d['auc']:.3f}"
+        log(f"  эпоха {ep:3d}: train {tr:.4f} | val {vloss:.4f} AUC {auc_s} "
+            f"Se {d['sens']:.2f} Sp {d['spec']:.2f} (порог {d['thr']:.3f}) | p {d['p_mean']:.3f}±{d['p_std']:.4f} "
+            f"| lr {opt.param_groups[0]['lr']:.1e} | {time.time() - t0:.0f} с{star}")
+        if not d["finite"]:
+            log("  ВНИМАНИЕ: в предсказаниях NaN/inf — попробуйте --amp off или меньше --lr-backbone")
+        elif d["p_std"] < 1e-4:
+            log("  ВНИМАНИЕ: предсказания на валидации почти постоянны — модель схлопнулась в константу "
+                "(проверьте --feature, --lr-backbone, --sanity-overfit)")
+        if bad_steps:
+            log(f"  пропущено шагов с NaN/inf: {bad_steps}")
+        if bad >= patience:
+            log("  ранняя остановка")
+            break
+    if ckpt.is_file():
+        model.load_state_dict(torch.load(ckpt, weights_only=True), strict=False)
+    return hist
+
+
+def build_model(a, device, log, verbose):
+    model = BENDR(a.feature, a.head_dropout)
+    model.load_pretrained(a.encoder, a.contextualizer, log if verbose else (lambda *_: None))
+    n_tr = set_freeze(model, a.freeze, a.unfreeze_last)
+    return model.to(device), n_tr
+
+
+def make_criterion(a, ytr):
+    cw = None
+    if a.balancing == "class_weights":
+        cw = (len(ytr) / (2 * np.maximum(np.bincount(ytr, minlength=2), 1))).tolist()
+    return Criterion(a.loss, cw, gamma=a.focal_gamma)
+
+
+def input_stats(dl, log, tag):
+    x, y = next(iter(dl))
+    x = x.float()
+    log(f"{tag}: вход батча {tuple(x.shape)} mean {x.mean():.3f} std {x.std():.3f} min {x.min():.2f} "
+        f"max {x.max():.2f}, приступов в батче {int(y.sum())}/{len(y)}, конечные: {bool(torch.isfinite(x).all())}")
+
+
+def feature_check(f, log, tag):
+    rel = float(f.std(0).mean() / (f.abs().mean() + 1e-12))
+    log(f"{tag}: признаки {tuple(f.shape)}, разброс между окнами {rel:.4f} (относительный)")
+    if rel < 1e-3:
+        log(f"  ВНИМАНИЕ: признак {tag} почти одинаков для всех окон — голова не сможет ничему научиться. "
+            f"Возьмите --feature ctx_mean / ctx_last / enc_mean.")
+
+
+def train_fold(fold, frac, caches, a, device, run_dir, log, first=False):
     tag = f"{fold['name']}_frac{round(frac * 100)}"
     out = run_dir / tag
     if (out / "preds.npz").is_file() and not a.force:
@@ -516,47 +654,82 @@ def train_fold(fold, frac, caches, a, device, run_dir, log):
         sel, _ = strat(lab(tr_it), frac, rng)
         tr_it = tr_it[sel]
     ytr, yva, yte = lab(tr_it), lab(fold["val"]), lab(fold["test"])
-    log(f"{tag}: train {len(ytr)} (приступ {ytr.sum()}), val {len(yva)} ({yva.sum()}), test {len(yte)} ({yte.sum()})")
+    log(f"{tag}: train {len(ytr)} (приступ {ytr.sum()}, {ytr.mean():.2%}), val {len(yva)} ({yva.sum()}), "
+        f"test {len(yte)} ({yte.sum()}); балансировка {a.balancing}, loss {a.loss}")
     if not ytr.sum() or not yva.sum():
         return log(f"{tag}: нет приступов в train/val — пропуск")
     norm = None if a.norm == "window" else global_norm(fold["norm"])
     ds = lambda it: Windows(cl, it, norm)
-    cw = (len(ytr) / (2 * np.maximum(np.bincount(ytr, minlength=2), 1))).tolist() if a.balancing == "class_weights" else None
-    crit = SSWCE(weights=cw)
-    model = BENDR(a.feature)
-    model.load_pretrained(a.encoder, a.contextualizer)
-    n_tr = set_freeze(model, a.freeze, a.unfreeze_last)
-    model.to(device)
-    amp = device.type == "cuda" and not a.no_amp
-    log(f"{tag}: режим {a.freeze}, обучаемых параметров {n_tr:,}, AMP {amp}")
+    crit = make_criterion(a, ytr)
+    model, n_tr = build_model(a, device, log, first)
+    dt = amp_dtype(a, device)
+    log(f"{tag}: freeze {a.freeze}, обучаемых {n_tr:,}, признак {a.feature}, AMP {dt}, "
+        f"lr голова {a.lr_head:g} / магистраль {a.lr_backbone:g}")
     ckpt = out / "best.pt"
     if a.freeze == "backbone":   # признаки BENDR один раз на фолд, дальше учится только голова
         if "feats" not in fold:
             t0 = time.time()
-            fold["feats"] = [predict(None, model, DataLoader(ds(fold[k]), a.batch_size, num_workers=a.workers),
-                                     device, amp, feats=True) for k in ("train", "val", "test")]
+            fold["feats"] = [extract(model, DataLoader(ds(fold[k]), a.batch_size, num_workers=a.workers), device, dt)
+                             for k in ("train", "val", "test")]
             log(f"{fold['name']}: признаки за {time.time() - t0:.0f} с")
+            feature_check(fold["feats"][0], log, a.feature)
         ftr, fva, fte = fold["feats"]
         if sel is not None:
             ftr = ftr[torch.as_tensor(sel)]
         tl = loader(TensorDataset(ftr, torch.as_tensor(ytr)), ytr, a, True, device, 0)
         vl = DataLoader(TensorDataset(fva, torch.as_tensor(yva)), a.batch_size)
         tel = DataLoader(TensorDataset(fte, torch.as_tensor(yte)), a.batch_size)
-        hist = fit(model.head, model, tl, vl, crit, a, device, False, ckpt, log)
-        pva, pte = predict(model.head, model, vl, device, False), predict(model.head, model, tel, device, False)
+        hist = fit(model, tl, vl, yva, crit, a, device, dt, ckpt, log, from_feats=True)
+        fe = True
     else:
         tl = loader(ds(tr_it), ytr, a, True, device, a.workers)
         vl, tel = (loader(ds(fold[k]), None, a, False, device, a.workers) for k in ("val", "test"))
-        hist = fit(model, model, tl, vl, crit, a, device, amp, ckpt, log)
-        pva, pte = predict(model, model, vl, device, amp), predict(model, model, tel, device, amp)
+        if first:
+            input_stats(tl, log, tag)
+        hist = fit(model, tl, vl, yva, crit, a, device, dt, ckpt, log)
+        fe = False
+    _, pva = predict(model, vl, crit, device, dt, fe)
+    _, pte = predict(model, tel, crit, device, dt, fe)
     thr = youden(yva, pva) if a.threshold == "youden" else 0.5
     tc, ti = cl[int(fold["test"][0, 0])], fold["test"][:, 1]
     np.savez_compressed(out / "preds.npz", p=pte, y=yte, file_idx=tc.file_idx[ti], starts=tc.starts[ti])
     events = {int(i): tc.files[i]["seizures"] for i in np.unique(tc.file_idx[ti])}
     info = {"fold": fold["name"], "fraction": frac, "freeze": a.freeze, "threshold": thr,
             "val_auc": auc(yva, pva), "events": events, "history": hist}
-    (out / "fold.json").write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
-    log(f"{tag}: порог {thr:.3f}, val AUC {info['val_auc']}, test AUC {auc(yte, pte)}")
+    (out / "fold.json").write_text(json.dumps(info, ensure_ascii=False, indent=1, default=float), encoding="utf-8")
+    log(f"{tag}: лучший val AUC {info['val_auc']}, test AUC {auc(yte, pte)}, порог {thr:.3f}")
+
+
+def sanity_overfit(a, caches, device, log):
+    """Проверка, что модель вообще может учиться: несколько сотен сбалансированных окон,
+    обучение и оценка на них же. Train AUC должен превысить 0,9."""
+    names = list(caches)
+    cl = [caches[n] for n in names]
+    fold = make_folds(a, caches, np.random.default_rng(a.seed))[0]
+    y = np.array([cl[c].labels[i] for c, i in fold["train"]])
+    rng = np.random.default_rng(a.seed)
+    k = a.sanity_n // 2
+    pos, neg = np.where(y == 1)[0], np.where(y == 0)[0]
+    pick = np.concatenate([rng.choice(pos, min(k, len(pos)), replace=False), rng.choice(neg, min(k, len(neg)), replace=False)])
+    it = fold["train"][pick]
+    ys = y[pick]
+    norm = None if a.norm == "window" else global_norm(fold["norm"])
+    ds = Windows(cl, it, norm)
+    a.balancing = "none"
+    tl = DataLoader(ds, batch_size=a.batch_size, shuffle=True, num_workers=a.workers)
+    el = DataLoader(ds, batch_size=a.batch_size, num_workers=a.workers)
+    model, n_tr = build_model(a, device, log, True)
+    dt = amp_dtype(a, device)
+    log(f"SANITY: {len(ys)} окон ({ys.sum()} приступ), freeze {a.freeze}, обучаемых {n_tr:,}, AMP {dt}")
+    input_stats(tl, log, "SANITY")
+    ckpt = Path(a.out) / "sanity_best.pt"
+    hist = fit(model, tl, el, ys, Criterion(a.loss, gamma=a.focal_gamma), a, device, dt, ckpt, log,
+               epochs=a.sanity_epochs, patience=a.sanity_epochs)
+    best = max((h["auc"] or 0) for h in hist)
+    ok = best > 0.9
+    log(f"SANITY: лучший train AUC {best:.3f} — {'OK, модель учится' if ok else 'НЕ ПРОЙДЕНО: модель не может переобучиться даже на маленьком наборе'}")
+    ckpt.unlink(missing_ok=True)
+    return ok
 
 
 # ----------------------------------------------------- оценка и пост-обработка
@@ -681,16 +854,29 @@ def main():
     ap.add_argument("--run-name", default=None, help="по умолчанию <схема>_<freeze>")
     ap.add_argument("--scheme", choices=["lopo", "patient_wise"], default="lopo")
     ap.add_argument("--test-patients", nargs="+", help="какие фолды считать (по умолчанию все)")
-    ap.add_argument("--freeze", choices=["full", "encoder", "partial", "backbone"], default="full")
+    ap.add_argument("--freeze", choices=["full", "encoder", "partial", "backbone"], default="full",
+                    help="full — всё; encoder — заморожен свёрточный энкодер; partial — учатся последние "
+                         "--unfreeze-last слоёв трансформера; backbone — только голова")
     ap.add_argument("--unfreeze-last", type=int, default=2, help="для partial (выбрано автором)")
+    ap.add_argument("--unfreeze-epoch", type=int, default=0,
+                    help="постепенная разморозка: первые N эпох учится только голова (0 — выкл.)")
     ap.add_argument("--fractions", nargs="+", type=float, default=[1.0], help="например 0.25 0.5 1.0")
-    ap.add_argument("--balancing", choices=["sampler", "class_weights", "none"], default="sampler")
+    ap.add_argument("--balancing", choices=["sampler", "class_weights", "none"], default="sampler",
+                    help="ровно один механизм: sampler (WeightedRandomSampler) или веса классов в loss")
+    ap.add_argument("--loss", choices=["sswce", "ce", "focal"], default="sswce")
+    ap.add_argument("--focal-gamma", type=float, default=2.0)
     ap.add_argument("--norm", choices=["global", "window"], default="global")
-    ap.add_argument("--feature", choices=["ctx_first", "ctx_mean", "enc_mean"], default="ctx_first")
+    ap.add_argument("--feature", choices=["ctx_mean", "ctx_last", "ctx_first", "enc_mean"], default="ctx_mean",
+                    help="вход головы; ctx_first с весами v0.1-alpha почти постоянен — не рекомендуется")
+    ap.add_argument("--head-dropout", type=float, default=0.0)
     ap.add_argument("--epochs", type=int, default=120)
-    ap.add_argument("--patience", type=int, default=15, help="ранняя остановка по val_loss")
+    ap.add_argument("--patience", type=int, default=15, help="ранняя остановка по --monitor")
+    ap.add_argument("--monitor", choices=["auc", "loss"], default="auc", help="критерий лучшей эпохи на валидации")
     ap.add_argument("--batch-size", type=int, default=256)
-    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--lr-head", type=float, default=1e-3, help="lr головы")
+    ap.add_argument("--lr-backbone", type=float, default=1e-5, help="lr энкодера и контекстуализатора")
+    ap.add_argument("--warmup", type=float, default=1.0, help="эпох линейного разогрева lr, далее косинус")
+    ap.add_argument("--clip", type=float, default=1.0, help="клиппинг нормы градиента")
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--val-fraction", type=float, default=0.2)
     ap.add_argument("--test-fraction", type=float, default=0.3, help="для patient_wise (выбрано автором)")
@@ -699,7 +885,12 @@ def main():
     ap.add_argument("--threshold", choices=["youden", "argmax"], default="youden")
     ap.add_argument("--vote-widths", nargs="+", type=int, default=[1, 3, 5, 7], help="1 = без пост-обработки")
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
-    ap.add_argument("--no-amp", action="store_true")
+    ap.add_argument("--amp", choices=["auto", "bf16", "fp16", "off"], default="auto",
+                    help="auto — bf16, если GPU поддерживает, иначе fp16 с GradScaler")
+    ap.add_argument("--sanity-overfit", action="store_true",
+                    help="быстрая проверка: переобучение на --sanity-n окнах, train AUC должен быть > 0,9")
+    ap.add_argument("--sanity-n", type=int, default=400)
+    ap.add_argument("--sanity-epochs", type=int, default=30)
     # на Windows процессы DataLoader запускаются через spawn и часто мешают — по умолчанию 0
     ap.add_argument("--workers", type=int, default=0 if os.name == "nt" else 4, help="процессов DataLoader")
     ap.add_argument("--threads", type=int, default=None, help="потоков torch на CPU")
@@ -738,9 +929,13 @@ def main():
     (run_dir / "args.json").write_text(json.dumps(vars(a), ensure_ascii=False, indent=1), encoding="utf-8")
     log(f"=== {time.strftime('%Y-%m-%d %H:%M')} | {device} "
         f"{torch.cuda.get_device_name(0) if device.type == 'cuda' else ''} | пациентов {len(caches)} | {run_dir}")
+    if a.sanity_overfit:
+        sys.exit(0 if sanity_overfit(a, caches, device, log) else 1)
+    first = True
     for fold in make_folds(a, caches, np.random.default_rng(a.seed)):
         for frac in a.fractions:
-            train_fold(fold, frac, caches, a, device, run_dir, log)
+            train_fold(fold, frac, caches, a, device, run_dir, log, first)
+            first = False
         fold.pop("feats", None)
     evaluate(run_dir, a.vote_widths)
 
